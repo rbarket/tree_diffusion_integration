@@ -1,0 +1,5 @@
+{
+  "raw_data_path": "data/raw/train_data.parquet",
+  "processed_data_path": "data/processed/train_prefix_filtered.parquet",
+  "vocab_path": "data/processed/vocab.json"
+}
