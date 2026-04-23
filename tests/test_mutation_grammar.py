@@ -13,8 +13,12 @@ from src.tree_diffusion.mutation_grammar import (
     POW_EXPR_FAMILY,
     UNARY_EXPR_FAMILY,
     VAR_FAMILY,
+    can_locally_replace,
     can_replace,
-    compatible_replacement_families,
+    can_sampled_subtree_replace,
+    local_replacement_candidates,
+    node_arity,
+    node_shape,
     production_family,
     subtree_size,
 )
@@ -25,31 +29,103 @@ class MutationGrammarTests(unittest.TestCase):
         self.assertEqual(production_family(Const(value=Fraction(1, 1))), CONST_FAMILY)
         self.assertEqual(production_family(Var(name="x")), VAR_FAMILY)
         self.assertEqual(production_family(UnaryOp(op="sin", operand=Var(name="x"))), UNARY_EXPR_FAMILY)
-        self.assertEqual(production_family(NaryOp(op="add", operands=(Var(name="x"), Const(value=Fraction(1, 1))))), ADD_EXPR_FAMILY)
-        self.assertEqual(production_family(NaryOp(op="mul", operands=(Var(name="x"), Const(value=Fraction(2, 1))))), MUL_EXPR_FAMILY)
-        self.assertEqual(production_family(BinaryOp(op="pow", left=Var(name="x"), right=Const(value=Fraction(2, 1)))), POW_EXPR_FAMILY)
-        self.assertEqual(production_family(BinaryOp(op="div", left=Var(name="x"), right=Const(value=Fraction(2, 1)))), DIV_EXPR_FAMILY)
+        self.assertEqual(
+            production_family(NaryOp(op="add", operands=(Var(name="x"), Const(value=Fraction(1, 1))))),
+            ADD_EXPR_FAMILY,
+        )
+        self.assertEqual(
+            production_family(NaryOp(op="mul", operands=(Var(name="x"), Const(value=Fraction(2, 1))))),
+            MUL_EXPR_FAMILY,
+        )
+        self.assertEqual(
+            production_family(BinaryOp(op="pow", left=Var(name="x"), right=Const(value=Fraction(2, 1)))),
+            POW_EXPR_FAMILY,
+        )
+        self.assertEqual(
+            production_family(BinaryOp(op="div", left=Var(name="x"), right=Const(value=Fraction(2, 1)))),
+            DIV_EXPR_FAMILY,
+        )
 
-    def test_same_family_compatibility_only(self) -> None:
-        expr = parse_prefix_string("sin x")
-        self.assertEqual(compatible_replacement_families(expr), (UNARY_EXPR_FAMILY,))
-        self.assertTrue(can_replace(expr, parse_prefix_string("cos x")))
-        self.assertFalse(can_replace(expr, parse_prefix_string("pow x INT+ 2")))
+    def test_node_shape_and_arity_follow_constructor_shape(self) -> None:
+        self.assertEqual(node_shape(Const(value=Fraction(1, 1))), "leaf")
+        self.assertEqual(node_shape(Var(name="x")), "leaf")
+        self.assertEqual(node_shape(UnaryOp(op="sin", operand=Var(name="x"))), "unary")
+        self.assertEqual(node_shape(BinaryOp(op="pow", left=Var(name="x"), right=Const(value=Fraction(2, 1)))), "binary")
+        self.assertEqual(
+            node_shape(NaryOp(op="add", operands=(Var(name="x"), Const(value=Fraction(1, 1)), Const(value=Fraction(2, 1))))),
+            "nary",
+        )
+        self.assertEqual(node_arity(Const(value=Fraction(1, 1))), 0)
+        self.assertEqual(node_arity(Var(name="x")), 0)
+        self.assertEqual(node_arity(UnaryOp(op="sin", operand=Var(name="x"))), 1)
+        self.assertEqual(node_arity(BinaryOp(op="pow", left=Var(name="x"), right=Const(value=Fraction(2, 1)))), 2)
+        self.assertEqual(
+            node_arity(NaryOp(op="add", operands=(Var(name="x"), Const(value=Fraction(1, 1)), Const(value=Fraction(2, 1))))),
+            3,
+        )
 
-    def test_const_rules_reject_non_const(self) -> None:
-        expr = parse_prefix_string("INT+ 2")
-        self.assertTrue(can_replace(expr, Const(value=Fraction(3, 1))))
-        self.assertFalse(can_replace(expr, parse_prefix_string("sin x")))
+    def test_leaf_local_replacements_allow_const_named_const_and_x(self) -> None:
+        const_expr = parse_prefix_string("INT+ 2")
+        self.assertTrue(can_locally_replace(const_expr, Var(name="x")))
+        self.assertTrue(can_locally_replace(const_expr, Const(symbol="Pi")))
 
-    def test_var_is_non_mutable(self) -> None:
-        expr = parse_prefix_string("x")
-        self.assertEqual(compatible_replacement_families(expr), ())
-        self.assertFalse(can_replace(expr, Var(name="x")))
+        var_expr = parse_prefix_string("x")
+        self.assertTrue(can_locally_replace(var_expr, Const(value=Fraction(1, 1))))
+        self.assertTrue(can_locally_replace(var_expr, Const(symbol="Pi")))
+        self.assertFalse(can_locally_replace(var_expr, Var(name="x")))
 
-    def test_pow_family_allows_non_constant_exponents(self) -> None:
+        const_candidates = {spec.leaf_kind for spec in local_replacement_candidates(const_expr)}
+        var_candidates = {spec.leaf_kind for spec in local_replacement_candidates(var_expr)}
+        self.assertEqual(const_candidates, {"numeric_const", "named_const", "var"})
+        self.assertEqual(var_candidates, {"numeric_const", "named_const"})
+
+    def test_unary_local_replacements_require_unary_shape(self) -> None:
+        self.assertTrue(can_locally_replace(parse_prefix_string("sin x"), parse_prefix_string("cos x")))
+        self.assertTrue(can_locally_replace(parse_prefix_string("exp x"), parse_prefix_string("ln x")))
+        self.assertFalse(can_locally_replace(parse_prefix_string("sin x"), parse_prefix_string("pow x INT+ 2")))
+        self.assertTrue(can_replace(parse_prefix_string("sin x"), parse_prefix_string("cos x")))
+
+    def test_binary_local_replacements_require_binary_shape(self) -> None:
+        self.assertTrue(can_locally_replace(parse_prefix_string("pow x INT+ 2"), parse_prefix_string("div x INT+ 2")))
+        self.assertTrue(can_locally_replace(parse_prefix_string("div x INT+ 2"), parse_prefix_string("pow x INT+ 2")))
+        self.assertFalse(can_locally_replace(parse_prefix_string("pow x INT+ 2"), parse_prefix_string("INT+ 2")))
+
+    def test_nary_local_replacements_require_same_operand_count(self) -> None:
+        original = NaryOp(
+            op="add",
+            operands=(Var(name="x"), Const(value=Fraction(1, 1)), Const(value=Fraction(2, 1))),
+        )
+        candidate = NaryOp(
+            op="mul",
+            operands=(Var(name="x"), Const(value=Fraction(1, 1)), Const(value=Fraction(2, 1))),
+        )
+        binary_candidate = BinaryOp(
+            op="pow",
+            left=Var(name="x"),
+            right=Const(value=Fraction(1, 1)),
+        )
+        self.assertTrue(can_locally_replace(original, candidate))
+        self.assertFalse(can_locally_replace(original, binary_candidate))
+        self.assertFalse(can_locally_replace(parse_prefix_string("add x INT+ 1"), parse_prefix_string("pow x INT+ 1")))
+
+    def test_identical_or_cross_shape_local_replacements_are_rejected(self) -> None:
+        self.assertFalse(can_locally_replace(parse_prefix_string("sin x"), parse_prefix_string("sin x")))
+        self.assertFalse(can_locally_replace(parse_prefix_string("pow x INT+ 2"), parse_prefix_string("INT+ 2")))
+        original = NaryOp(
+            op="add",
+            operands=(Var(name="x"), Const(value=Fraction(1, 1)), Const(value=Fraction(2, 1))),
+        )
+        binary_candidate = BinaryOp(
+            op="pow",
+            left=Var(name="x"),
+            right=Const(value=Fraction(1, 1)),
+        )
+        self.assertFalse(can_locally_replace(original, binary_candidate))
+
+    def test_subtree_replacement_still_allows_broader_shape_changes_inside_subtree(self) -> None:
         expr = parse_prefix_string("pow x sin x")
         candidate = parse_prefix_string("pow x add x INT+ 1")
-        self.assertTrue(can_replace(expr, candidate))
+        self.assertTrue(can_sampled_subtree_replace(expr, candidate))
 
     def test_subtree_size_counts_operator_nodes_only(self) -> None:
         expr = parse_prefix_string("add sin x pow x INT+ 2")

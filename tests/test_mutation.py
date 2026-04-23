@@ -4,25 +4,77 @@ import random
 import unittest
 from fractions import Fraction
 
-from src.mathlang.ast import Const
+from src.mathlang.ast import BinaryOp, Const, NaryOp, UnaryOp, Var
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.mutation import (
+    local_replace_once,
     mutate_once,
     replace_subtree_by_node_id,
     sample_const_replacement,
     sample_valid_subtree,
 )
-from src.tree_diffusion.mutation_grammar import can_replace
+from src.tree_diffusion.mutation_grammar import can_locally_replace, can_sampled_subtree_replace
 from src.tree_diffusion.positions import index_tree_positions
 
 
 class MutationTests(unittest.TestCase):
-    def test_unary_family_swap_is_legal(self) -> None:
-        self.assertTrue(
-            can_replace(parse_prefix_string("sin x"), parse_prefix_string("cos x"))
+    def test_local_replace_once_on_constant_leaf(self) -> None:
+        expr = canonicalize(parse_prefix_string("pow x INT+ 5"))
+        index = index_tree_positions(expr)
+        exponent_position = next(
+            position
+            for position in index.positions
+            if position.production_family == "CONST" and position.token_start > 0
         )
+
+        result = local_replace_once(expr, exponent_position.node_id, rng=random.Random(0))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(can_locally_replace(result.original_subtree, result.replacement_subtree))
+        reparsed = parse_prefix_string(serialize_prefix_string(result.mutated_expr))
+        self.assertEqual(result.mutated_expr, canonicalize(reparsed))
+
+    def test_local_replace_once_on_variable_leaf(self) -> None:
+        result = local_replace_once(parse_prefix_string("x"), selected_node_id=0, rng=random.Random(0))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.selected_family, "VAR")
+        self.assertNotIsInstance(result.replacement_subtree, Var)
+        reparsed = parse_prefix_string(serialize_prefix_string(result.mutated_expr))
+        self.assertEqual(result.mutated_expr, canonicalize(reparsed))
+
+    def test_local_replace_once_on_unary_node_preserves_child(self) -> None:
+        result = local_replace_once(parse_prefix_string("sin x"), selected_node_id=0, rng=random.Random(0))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIsInstance(result.replacement_subtree, UnaryOp)
+        self.assertEqual(result.replacement_subtree.operand, result.original_subtree.operand)
+        self.assertTrue(can_locally_replace(result.original_subtree, result.replacement_subtree))
+
+    def test_local_replace_once_on_binary_node_preserves_children(self) -> None:
+        result = local_replace_once(parse_prefix_string("pow x INT+ 2"), selected_node_id=0, rng=random.Random(0))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIsInstance(result.replacement_subtree, BinaryOp)
+        self.assertEqual(result.replacement_subtree.left, result.original_subtree.left)
+        self.assertEqual(result.replacement_subtree.right, result.original_subtree.right)
+        self.assertEqual(serialize_prefix_string(result.replacement_subtree), "div x INT+ 2")
+
+    def test_local_replace_once_on_nary_node_preserves_operands(self) -> None:
+        expr = NaryOp(
+            op="mul",
+            operands=(Var(name="x"), Const(value=Fraction(1, 1)), Const(value=Fraction(2, 1))),
+        )
+        result = local_replace_once(expr, selected_node_id=0, rng=random.Random(0))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIsInstance(result.replacement_subtree, NaryOp)
+        self.assertEqual(result.replacement_subtree.op, "add")
+        self.assertEqual(result.replacement_subtree.operands, result.original_subtree.operands)
+        reparsed = parse_prefix_string(serialize_prefix_string(result.mutated_expr))
+        self.assertEqual(result.mutated_expr, canonicalize(reparsed))
 
     def test_pow_exponent_constant_mutation_is_legal(self) -> None:
         expr = canonicalize(parse_prefix_string("pow x INT+ 5"))
@@ -39,16 +91,6 @@ class MutationTests(unittest.TestCase):
         )
         self.assertEqual(serialize_prefix_string(mutated), "pow x INT+ 3")
 
-    def test_const_cannot_be_replaced_with_unary_subtree(self) -> None:
-        self.assertFalse(
-            can_replace(parse_prefix_string("INT+ 2"), parse_prefix_string("sin x"))
-        )
-
-    def test_pow_to_div_direct_replacement_is_illegal(self) -> None:
-        self.assertFalse(
-            can_replace(parse_prefix_string("pow x INT+ 2"), parse_prefix_string("div x INT+ 2"))
-        )
-
     def test_sampled_subtrees_roundtrip(self) -> None:
         rng = random.Random(0)
         for family in ("CONST", "UNARY_EXPR", "ADD_EXPR", "MUL_EXPR", "POW_EXPR", "DIV_EXPR"):
@@ -60,8 +102,10 @@ class MutationTests(unittest.TestCase):
     def test_mutation_respects_sigma_small(self) -> None:
         result = mutate_once(parse_prefix_string("pow x INT+ 5"), sigma_small=0, rng=random.Random(0))
         self.assertIsNotNone(result)
-        self.assertEqual(result.selected_family, "CONST")
-        self.assertEqual(serialize_prefix_string(result.mutated_expr).split()[0], "pow")
+        assert result is not None
+        self.assertIn(result.selected_family, {"CONST", "VAR"})
+        reparsed = parse_prefix_string(serialize_prefix_string(result.mutated_expr))
+        self.assertEqual(result.mutated_expr, canonicalize(reparsed))
 
     def test_repeated_mutation_does_not_crash(self) -> None:
         rng = random.Random(7)
@@ -69,14 +113,26 @@ class MutationTests(unittest.TestCase):
         for _ in range(20):
             result = mutate_once(expr, sigma_small=2, rng=rng)
             self.assertIsNotNone(result)
+            assert result is not None
             expr = result.mutated_expr
             reparsed = parse_prefix_string(serialize_prefix_string(expr))
             self.assertEqual(expr, canonicalize(reparsed))
 
-    def test_single_variable_leaf_has_no_mutation(self) -> None:
-        self.assertIsNone(mutate_once(parse_prefix_string("x"), sigma_small=0, rng=random.Random(0)))
+    def test_single_variable_leaf_now_has_local_mutation(self) -> None:
+        result = mutate_once(parse_prefix_string("x"), sigma_small=0, rng=random.Random(0))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.selected_family, "VAR")
 
     def test_const_replacement_is_local(self) -> None:
         replacement = sample_const_replacement(Const(value=Fraction(2, 1)), random.Random(0))
         self.assertIsInstance(replacement, Const)
         self.assertNotEqual(replacement.value, Fraction(2, 1))
+
+    def test_subtree_replacement_still_supports_broader_descendant_shape_changes(self) -> None:
+        original = parse_prefix_string("pow x sin x")
+        replacement = parse_prefix_string("pow x add x INT+ 1")
+        self.assertTrue(can_sampled_subtree_replace(original, replacement))
+        mutated = canonicalize(replace_subtree_by_node_id(canonicalize(original), 0, replacement))
+        reparsed = parse_prefix_string(serialize_prefix_string(mutated))
+        self.assertEqual(mutated, canonicalize(reparsed))

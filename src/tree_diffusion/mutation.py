@@ -6,24 +6,32 @@ from fractions import Fraction
 
 from src.mathlang.ast import BinaryOp, Const, Expr, NaryOp, UnaryOp, Var
 from src.mathlang.canonicalize import canonicalize
-from src.mathlang.serializer import serialize_prefix_tokens
 from src.tree_diffusion.mutation_grammar import (
     ADD_EXPR_FAMILY,
     CONST_FAMILY,
     DIV_EXPR_FAMILY,
     EXPR_FAMILY,
+    NAMED_CONST_LEAF,
+    LocalReplacementSpec,
     MUL_EXPR_FAMILY,
     NAMED_CONSTANT_BANK,
+    NUMERIC_CONST_LEAF,
     NUMERIC_CONSTANT_BANK,
     POW_EXPR_FAMILY,
     UNARY_EXPR_FAMILY,
     UNARY_OPERATORS,
-    can_replace,
+    VAR_LEAF,
+    can_locally_replace,
+    can_sampled_subtree_replace,
     compatible_replacement_families,
-    production_family,
-    subtree_size,
+    has_local_replacement,
+    local_replacement_candidates,
 )
 from src.tree_diffusion.positions import NodePosition, PositionIndex, index_tree_positions
+
+LOCAL_CONST_EDIT = "local_const_edit"
+LOCAL_SAME_ARITY_REPLACEMENT = "local_same_arity_replacement"
+SAMPLED_SMALL_SUBTREE_REPLACEMENT = "sampled_small_subtree_replacement"
 
 
 @dataclass(frozen=True)
@@ -96,33 +104,71 @@ def mutate_once(
         family = rng.choice(families)
         selected_position = rng.choice(candidates_by_family[family])
         original_subtree = index.node_id_to_node[selected_position.node_id]
+        mutation_kind = _sample_mutation_kind(original_subtree, rng)
+        if mutation_kind is None:
+            continue
 
-        if family == CONST_FAMILY:
+        if mutation_kind == LOCAL_CONST_EDIT:
             replacement = sample_const_replacement(original_subtree, rng)
-        else:
-            replacement = sample_valid_subtree(family, sigma_small, rng)
+            if replacement == original_subtree:
+                continue
+            result = _apply_replacement(
+                canonical_expr,
+                selected_position,
+                original_subtree,
+                replacement,
+            )
+            if result is not None:
+                return result
+            continue
 
-        if not can_replace(original_subtree, replacement):
+        if mutation_kind == LOCAL_SAME_ARITY_REPLACEMENT:
+            result = _local_replace_selected_node(
+                canonical_expr,
+                selected_position,
+                original_subtree,
+                rng,
+            )
+            if result is not None:
+                return result
+            continue
+
+        replacement = sample_valid_subtree(family, sigma_small, rng)
+        if not can_sampled_subtree_replace(original_subtree, replacement):
             continue
         if replacement == original_subtree:
             continue
-
-        mutated_expr = replace_subtree_by_node_id(canonical_expr, selected_position.node_id, replacement)
-        canonical_mutated = canonicalize(mutated_expr)
-        if canonical_mutated == canonical_expr:
-            continue
-
-        return MutationResult(
-            mutated_expr=canonical_mutated,
-            selected_node_id=selected_position.node_id,
-            selected_family=family,
-            original_subtree=original_subtree,
-            replacement_subtree=replacement,
-            selected_token_start=selected_position.token_start,
-            selected_token_end=selected_position.token_end,
+        result = _apply_replacement(
+            canonical_expr,
+            selected_position,
+            original_subtree,
+            replacement,
         )
+        if result is not None:
+            return result
 
     return None
+
+
+def local_replace_once(
+    expr: Expr,
+    selected_node_id: int,
+    rng: random.Random,
+    max_attempts: int = 32,
+) -> MutationResult | None:
+    canonical_expr = canonicalize(expr)
+    index = index_tree_positions(canonical_expr)
+    if selected_node_id < 0 or selected_node_id >= len(index.positions):
+        raise KeyError(f"Unknown node_id: {selected_node_id}")
+    selected_position = index.positions[selected_node_id]
+    original_subtree = index.node_id_to_node[selected_position.node_id]
+    return _local_replace_selected_node(
+        canonical_expr,
+        selected_position,
+        original_subtree,
+        rng,
+        max_attempts=max_attempts,
+    )
 
 
 def sample_const_replacement(node: Expr, rng: random.Random) -> Const:
@@ -254,6 +300,112 @@ def _split_budget(total: int, parts: int, rng: random.Random) -> tuple[int, ...]
 
 def _node_count(node: Expr) -> int:
     return 1 + sum(_node_count(child) for child in node.children())
+
+
+def _sample_mutation_kind(node: Expr, rng: random.Random) -> str | None:
+    kinds: list[str] = []
+    if isinstance(node, Const):
+        kinds.append(LOCAL_CONST_EDIT)
+        if has_local_replacement(node):
+            kinds.append(LOCAL_SAME_ARITY_REPLACEMENT)
+    elif isinstance(node, Var):
+        if has_local_replacement(node):
+            kinds.append(LOCAL_SAME_ARITY_REPLACEMENT)
+    elif isinstance(node, (UnaryOp, BinaryOp, NaryOp)):
+        if has_local_replacement(node):
+            kinds.append(LOCAL_SAME_ARITY_REPLACEMENT)
+        if compatible_replacement_families(node):
+            kinds.append(SAMPLED_SMALL_SUBTREE_REPLACEMENT)
+
+    if not kinds:
+        return None
+    return rng.choice(kinds)
+
+
+def _local_replace_selected_node(
+    canonical_expr: Expr,
+    selected_position: NodePosition,
+    original_subtree: Expr,
+    rng: random.Random,
+    max_attempts: int = 32,
+) -> MutationResult | None:
+    candidates = local_replacement_candidates(original_subtree)
+    if not candidates:
+        return None
+
+    for _ in range(max_attempts):
+        spec = rng.choice(candidates)
+        replacement = _materialize_local_replacement(original_subtree, spec, rng)
+        if not can_locally_replace(original_subtree, replacement):
+            continue
+        result = _apply_replacement(
+            canonical_expr,
+            selected_position,
+            original_subtree,
+            replacement,
+        )
+        if result is not None:
+            return result
+
+    return None
+
+
+def _materialize_local_replacement(
+    node: Expr,
+    spec: LocalReplacementSpec,
+    rng: random.Random,
+) -> Expr:
+    if isinstance(node, (Const, Var)):
+        if spec.leaf_kind == NUMERIC_CONST_LEAF:
+            if isinstance(node, Const) and node.is_numeric:
+                return sample_const_replacement(node, rng)
+            return Const(value=rng.choice(NUMERIC_CONSTANT_BANK))
+        if spec.leaf_kind == NAMED_CONST_LEAF:
+            if isinstance(node, Const) and node.is_named:
+                return sample_const_replacement(node, rng)
+            return Const(symbol=rng.choice(NAMED_CONSTANT_BANK))
+        if spec.leaf_kind == VAR_LEAF:
+            return Var(name="x")
+        raise ValueError(f"Unsupported leaf replacement kind: {spec.leaf_kind}")
+
+    if isinstance(node, UnaryOp):
+        if spec.op is None:
+            raise ValueError("Unary replacement spec must include an operator.")
+        return UnaryOp(op=spec.op, operand=node.operand)
+
+    if isinstance(node, BinaryOp):
+        if spec.op is None:
+            raise ValueError("Binary replacement spec must include an operator.")
+        return BinaryOp(op=spec.op, left=node.left, right=node.right)
+
+    if isinstance(node, NaryOp):
+        if spec.op is None:
+            raise ValueError("N-ary replacement spec must include an operator.")
+        return NaryOp(op=spec.op, operands=node.operands)
+
+    raise TypeError(f"Unsupported expression type: {type(node).__name__}")
+
+
+def _apply_replacement(
+    canonical_expr: Expr,
+    selected_position: NodePosition,
+    original_subtree: Expr,
+    replacement: Expr,
+) -> MutationResult | None:
+    mutated_expr = replace_subtree_by_node_id(canonical_expr, selected_position.node_id, replacement)
+    canonical_mutated = canonicalize(mutated_expr)
+    if canonical_mutated == canonical_expr:
+        return None
+
+    return MutationResult(
+        mutated_expr=canonical_mutated,
+        selected_node_id=selected_position.node_id,
+        selected_family=selected_position.production_family,
+        original_subtree=original_subtree,
+        replacement_subtree=replacement,
+        selected_token_start=selected_position.token_start,
+        selected_token_end=selected_position.token_end,
+    )
 
 
 def _replace_subtree(

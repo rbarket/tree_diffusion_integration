@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from src.mathlang.ast import BinaryOp, Const, Expr, NaryOp, UnaryOp, Var
 from src.mathlang.serializer import serialize_prefix_tokens
-from src.tree_diffusion.mutation_grammar import compatible_replacement_families, production_family, subtree_size
+from src.tree_diffusion.mutation_grammar import has_local_replacement, production_family, subtree_size
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ def index_tree_positions(expr: Expr, sigma_small: int | None = None) -> Position
         node_id = len(positions)
         family = production_family(node)
         span = (cursor, cursor + token_length(node))
-        mutable = bool(compatible_replacement_families(node))
+        mutable = has_local_replacement(node)
         if sigma_small is not None:
             mutable = mutable and subtree_size(node) <= sigma_small
 
