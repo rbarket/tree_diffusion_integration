@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 import unittest
 
-from src.mathlang.ast import BinaryOp, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, UnaryOp, Var
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
@@ -40,15 +40,15 @@ class LocalReplacementTests(unittest.TestCase):
         self.assertTrue(can_locally_replace(parse_prefix_string("pow x INT+ 2"), parse_prefix_string("div x INT+ 2")))
         self.assertTrue(
             can_locally_replace(
-                parse_prefix_string("add x add INT+ 1 INT+ 2"),
-                parse_prefix_string("mul x mul INT+ 1 INT+ 2"),
+                parse_prefix_string("add x pow x INT+ 2"),
+                parse_prefix_string("mul x pow x INT+ 2"),
             )
         )
 
     def test_cross_shape_and_cross_arity_local_replacements_are_illegal(self) -> None:
         self.assertFalse(can_locally_replace(parse_prefix_string("sin x"), parse_prefix_string("pow x INT+ 2")))
         self.assertFalse(can_locally_replace(parse_prefix_string("pow x INT+ 2"), parse_prefix_string("INT+ 2")))
-        self.assertFalse(can_locally_replace(parse_prefix_string("add x INT+ 1"), parse_prefix_string("pow x INT+ 1")))
+        self.assertTrue(can_locally_replace(parse_prefix_string("add x INT+ 1"), parse_prefix_string("pow x INT+ 1")))
         self.assertFalse(
             can_locally_replace(
                 parse_prefix_string("add x add INT+ 1 INT+ 2"),
@@ -60,7 +60,7 @@ class LocalReplacementTests(unittest.TestCase):
         cases = (
             ("unary", canonical_expr("sin x")),
             ("binary", canonical_expr("pow x INT+ 2")),
-            ("nary_many", canonical_expr("add x add sin x add pow x INT+ 2 ln x")),
+            ("associative_chain", canonical_expr("add x add sin x add pow x INT+ 2 ln x")),
         )
 
         for case_name, expr in cases:
@@ -78,22 +78,16 @@ class LocalReplacementTests(unittest.TestCase):
                 elif isinstance(result.original_subtree, BinaryOp):
                     self.assertEqual(result.original_subtree.left, result.replacement_subtree.left)
                     self.assertEqual(result.original_subtree.right, result.replacement_subtree.right)
-                elif isinstance(result.original_subtree, NaryOp):
-                    self.assertEqual(result.original_subtree.operands, result.replacement_subtree.operands)
-                    self.assertEqual(
-                        len(result.original_subtree.operands),
-                        len(result.replacement_subtree.operands),
-                    )
 
-    def test_local_replace_once_can_mutate_a_many_operand_nary_root(self) -> None:
+    def test_local_replace_once_can_mutate_an_associative_binary_root(self) -> None:
         expr = canonical_expr("add x add sin x add pow x INT+ 2 add ln x cos x")
         result = local_replace_once(expr, selected_node_id=0, rng=random.Random(0))
         validate_mutation_result(self, expr, result)
         assert result is not None
 
-        self.assertIsInstance(result.original_subtree, NaryOp)
-        self.assertIsInstance(result.replacement_subtree, NaryOp)
-        self.assertEqual(len(result.original_subtree.operands), 5)
-        self.assertEqual(len(result.replacement_subtree.operands), 5)
+        self.assertIsInstance(result.original_subtree, BinaryOp)
+        self.assertIsInstance(result.replacement_subtree, BinaryOp)
+        self.assertEqual(result.original_subtree.left, result.replacement_subtree.left)
+        self.assertEqual(result.original_subtree.right, result.replacement_subtree.right)
         self.assertEqual(result.original_subtree.op, "add")
-        self.assertEqual(result.replacement_subtree.op, "mul")
+        self.assertNotEqual(result.replacement_subtree.op, "add")

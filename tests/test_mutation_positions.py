@@ -37,7 +37,7 @@ class MutationPositionTests(unittest.TestCase):
             list(range(len(validated.post_index.positions))),
         )
 
-    def test_reindex_after_root_local_mutation_of_many_operand_nary_tree(self) -> None:
+    def test_reindex_after_root_local_mutation_of_associative_binary_tree(self) -> None:
         expr = canonical_expr("add x add sin x add pow x INT+ 2 add ln x cos x")
         result = local_replace_once(expr, selected_node_id=0, rng=random.Random(0))
         validated = validate_mutation_result(self, expr, result)

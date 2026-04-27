@@ -11,8 +11,8 @@ CASE_SEEDS = {
     "leaf_only": 1,
     "unary": 1,
     "binary": 0,
-    "nary_add": 1,
-    "nary_mul": 4,
+    "associative_add": 1,
+    "associative_mul": 4,
     "mixed": 4,
 }
 

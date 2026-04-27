@@ -4,7 +4,7 @@ import random
 import unittest
 from fractions import Fraction
 
-from src.mathlang.ast import BinaryOp, Const, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, Const, UnaryOp, Var
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
@@ -60,19 +60,20 @@ class MutationTests(unittest.TestCase):
         self.assertIsInstance(result.replacement_subtree, BinaryOp)
         self.assertEqual(result.replacement_subtree.left, result.original_subtree.left)
         self.assertEqual(result.replacement_subtree.right, result.original_subtree.right)
-        self.assertEqual(serialize_prefix_string(result.replacement_subtree), "div x INT+ 2")
+        self.assertEqual(serialize_prefix_string(result.replacement_subtree), "mul x INT+ 2")
 
-    def test_local_replace_once_on_nary_node_preserves_operands(self) -> None:
-        expr = NaryOp(
+    def test_local_replace_once_on_binary_add_mul_node_preserves_children(self) -> None:
+        expr = BinaryOp(
             op="mul",
-            operands=(Var(name="x"), Const(value=Fraction(1, 1)), Const(value=Fraction(2, 1))),
+            left=Var(name="x"),
+            right=Const(value=Fraction(2, 1)),
         )
         result = local_replace_once(expr, selected_node_id=0, rng=random.Random(0))
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertIsInstance(result.replacement_subtree, NaryOp)
-        self.assertEqual(result.replacement_subtree.op, "add")
-        self.assertEqual(result.replacement_subtree.operands, result.original_subtree.operands)
+        self.assertIsInstance(result.replacement_subtree, BinaryOp)
+        self.assertEqual(result.replacement_subtree.left, result.original_subtree.left)
+        self.assertEqual(result.replacement_subtree.right, result.original_subtree.right)
         reparsed = parse_prefix_string(serialize_prefix_string(result.mutated_expr))
         self.assertEqual(result.mutated_expr, canonicalize(reparsed))
 
@@ -96,6 +97,9 @@ class MutationTests(unittest.TestCase):
         for family in ("CONST", "UNARY_EXPR", "ADD_EXPR", "MUL_EXPR", "POW_EXPR", "DIV_EXPR"):
             with self.subTest(family=family):
                 subtree = sample_valid_subtree(family, sigma_small=2, rng=rng)
+                if family in {"ADD_EXPR", "MUL_EXPR"}:
+                    self.assertIsInstance(subtree, BinaryOp)
+                    self.assertIn(subtree.op, {"add", "mul"})
                 reparsed = parse_prefix_string(serialize_prefix_string(subtree))
                 self.assertEqual(canonicalize(subtree), canonicalize(reparsed))
 

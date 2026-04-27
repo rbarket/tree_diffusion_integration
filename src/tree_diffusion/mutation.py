@@ -4,7 +4,7 @@ import random
 from dataclasses import dataclass
 from fractions import Fraction
 
-from src.mathlang.ast import BinaryOp, Const, Expr, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
 from src.mathlang.canonicalize import canonicalize
 from src.tree_diffusion.mutation_grammar import (
     ADD_EXPR_FAMILY,
@@ -66,9 +66,9 @@ def sample_valid_subtree(family: str, sigma_small: int, rng: random.Random) -> E
             raise ValueError("UNARY_EXPR requires sigma_small >= 1.")
         return UnaryOp(op=rng.choice(UNARY_OPERATORS), operand=_sample_expr(sigma_small - 1, rng))
     if family == ADD_EXPR_FAMILY:
-        return _sample_nary("add", sigma_small, rng)
+        return _sample_binary_expr("add", sigma_small, rng)
     if family == MUL_EXPR_FAMILY:
-        return _sample_nary("mul", sigma_small, rng)
+        return _sample_binary_expr("mul", sigma_small, rng)
     if family == POW_EXPR_FAMILY:
         if sigma_small < 1:
             raise ValueError("POW_EXPR requires sigma_small >= 1.")
@@ -250,14 +250,16 @@ def _sample_any_const(rng: random.Random) -> Const:
     return Const(symbol=rng.choice(NAMED_CONSTANT_BANK))
 
 
-def _sample_nary(op: str, sigma_small: int, rng: random.Random) -> NaryOp:
+def _sample_binary_expr(op: str, sigma_small: int, rng: random.Random) -> BinaryOp:
     if sigma_small < 1:
         raise ValueError(f"{op} requires sigma_small >= 1.")
     remaining = sigma_small - 1
-    operand_count = 2 if remaining <= 1 or rng.random() < 0.75 else 3
-    budgets = _split_budget(remaining, operand_count, rng)
-    operands = tuple(_sample_expr(budget, rng) for budget in budgets)
-    return NaryOp(op=op, operands=operands)
+    left_budget, right_budget = _split_budget(remaining, 2, rng)
+    return BinaryOp(
+        op=op,
+        left=_sample_expr(left_budget, rng),
+        right=_sample_expr(right_budget, rng),
+    )
 
 
 def _sample_pow_exponent(sigma_small: int, rng: random.Random) -> Expr:
@@ -311,7 +313,7 @@ def _sample_mutation_kind(node: Expr, rng: random.Random) -> str | None:
     elif isinstance(node, Var):
         if has_local_replacement(node):
             kinds.append(LOCAL_SAME_ARITY_REPLACEMENT)
-    elif isinstance(node, (UnaryOp, BinaryOp, NaryOp)):
+    elif isinstance(node, (UnaryOp, BinaryOp)):
         if has_local_replacement(node):
             kinds.append(LOCAL_SAME_ARITY_REPLACEMENT)
         if compatible_replacement_families(node):
@@ -378,11 +380,6 @@ def _materialize_local_replacement(
             raise ValueError("Binary replacement spec must include an operator.")
         return BinaryOp(op=spec.op, left=node.left, right=node.right)
 
-    if isinstance(node, NaryOp):
-        if spec.op is None:
-            raise ValueError("N-ary replacement spec must include an operator.")
-        return NaryOp(op=spec.op, operands=node.operands)
-
     raise TypeError(f"Unsupported expression type: {type(node).__name__}")
 
 
@@ -447,19 +444,5 @@ def _replace_subtree(
             next_id=next_id,
         )
         return BinaryOp(op=node.op, left=left, right=right), next_id, found_left or found_right
-
-    if isinstance(node, NaryOp):
-        operands: list[Expr] = []
-        found = False
-        for child in node.operands:
-            updated_child, next_id, child_found = _replace_subtree(
-                child,
-                target_id=target_id,
-                replacement=replacement,
-                next_id=next_id,
-            )
-            operands.append(updated_child)
-            found = found or child_found
-        return NaryOp(op=node.op, operands=tuple(operands)), next_id, found
 
     raise TypeError(f"Unsupported expression type: {type(node).__name__}")

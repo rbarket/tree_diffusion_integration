@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from fractions import Fraction
 
-from src.mathlang.ast import Const, NaryOp
+from src.mathlang.ast import BinaryOp, Const
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
@@ -21,11 +21,10 @@ class CanonicalizationTests(unittest.TestCase):
 
     def test_associative_normalization(self) -> None:
         expr = self.canonical("add sin x add x pow x INT+ 3")
-        self.assertIsInstance(expr, NaryOp)
-        self.assertEqual(
-            [serialize_prefix_string(operand) for operand in expr.operands],
-            ["x", "sin x", "pow x INT+ 3"],
-        )
+        self.assertIsInstance(expr, BinaryOp)
+        self.assertEqual(serialize_prefix_string(expr), "add x add sin x pow x INT+ 3")
+        self.assertIsInstance(expr.right, BinaryOp)
+        self.assertEqual(expr.right.op, "add")
 
     def test_signed_rational_normalization(self) -> None:
         expr = self.canonical("div INT- 2 INT- 4")

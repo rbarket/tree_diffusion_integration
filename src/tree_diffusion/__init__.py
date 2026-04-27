@@ -1,5 +1,16 @@
 """Tree diffusion infrastructure for symbolic integration."""
 
+from src.tree_diffusion.edit_path import (
+    EditTarget,
+    FirstMismatch,
+    compute_edit_path,
+    find_first_mismatch,
+    first_edit_toward_target,
+    is_small_enough,
+    structural_distance,
+    subtree_size,
+    trees_equal,
+)
 from src.tree_diffusion.mutation import (
     MutationResult,
     collect_candidate_nodes,

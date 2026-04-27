@@ -92,23 +92,3 @@ class BinaryOp(Expr):
     @property
     def production_label(self) -> str:
         return self.op
-
-
-@dataclass(frozen=True)
-class NaryOp(Expr):
-    op: str
-    operands: tuple[Expr, ...]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "operands", tuple(self.operands))
-        if len(self.operands) < 2:
-            raise ValueError("NaryOp requires at least two operands.")
-        if self.op not in {"add", "mul"}:
-            raise ValueError(f"Unsupported n-ary operator: {self.op}")
-
-    def children(self) -> tuple[Expr, ...]:
-        return self.operands
-
-    @property
-    def production_label(self) -> str:
-        return self.op

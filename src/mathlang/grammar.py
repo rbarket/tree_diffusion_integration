@@ -25,8 +25,8 @@ class OperatorSpec:
 
 
 OPERATOR_SPECS = {
-    "add": OperatorSpec("add", "nary", 2, True, True, "operator"),
-    "mul": OperatorSpec("mul", "nary", 2, True, True, "operator"),
+    "add": OperatorSpec("add", "binary", 2, True, True, "operator"),
+    "mul": OperatorSpec("mul", "binary", 2, True, True, "operator"),
     "pow": OperatorSpec("pow", "binary", 2, False, False, "operator"),
     "div": OperatorSpec("div", "binary", 2, False, False, "operator"),
     "ln": OperatorSpec("ln", "unary", 1, False, False, "function"),

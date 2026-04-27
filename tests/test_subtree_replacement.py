@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 import unittest
 
-from src.mathlang.ast import BinaryOp, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, UnaryOp, Var
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
@@ -47,7 +47,7 @@ class SubtreeReplacementTests(unittest.TestCase):
         self.assertTrue(can_sampled_subtree_replace(result.original_subtree, result.replacement_subtree))
         self.assertIsInstance(result.replacement_subtree, BinaryOp)
 
-    def test_mutate_once_can_do_nary_subtree_replacement_with_arity_change(self) -> None:
+    def test_mutate_once_can_do_add_mul_binary_subtree_replacement(self) -> None:
         expr = canonical_expr("mul x mul sin x pow x INT+ 2")
         sigma_small = 3
 
@@ -55,15 +55,12 @@ class SubtreeReplacementTests(unittest.TestCase):
         validated = validate_mutation_result(self, expr, result, sigma_small=sigma_small)
         assert result is not None
 
-        self.assertEqual(result.selected_node_id, 0)
+        self.assertEqual(result.selected_family, "MUL_EXPR")
         self.assertEqual(validated.possible_kinds, frozenset({SAMPLED_SMALL_SUBTREE_REPLACEMENT}))
         self.assertFalse(can_locally_replace(result.original_subtree, result.replacement_subtree))
         self.assertTrue(can_sampled_subtree_replace(result.original_subtree, result.replacement_subtree))
-        self.assertIsInstance(result.replacement_subtree, NaryOp)
-        self.assertNotEqual(
-            len(result.original_subtree.operands),
-            len(result.replacement_subtree.operands),
-        )
+        self.assertIsInstance(result.replacement_subtree, BinaryOp)
+        self.assertEqual(result.original_subtree.op, result.replacement_subtree.op)
 
     def test_manual_sampled_subtree_replacement_roundtrips_for_a_non_root_subtree(self) -> None:
         expr = canonical_expr("add div sin x INT+ 2 add mul pow x INT+ 3 cos x ln x")

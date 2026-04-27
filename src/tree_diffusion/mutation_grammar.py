@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fractions import Fraction
 
-from src.mathlang.ast import BinaryOp, Const, Expr, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
 from src.mathlang.grammar import NAMED_CONSTANT_TOKENS, OPERATOR_SPECS
 
 
@@ -22,9 +22,6 @@ UNARY_OPERATORS = tuple(
 BINARY_OPERATORS = tuple(
     token for token, spec in OPERATOR_SPECS.items() if spec.arity_kind == "binary"
 )
-NARY_OPERATORS = tuple(
-    token for token, spec in OPERATOR_SPECS.items() if spec.arity_kind == "nary"
-)
 NUMERIC_CONSTANT_BANK = (
     Fraction(-1, 1),
     Fraction(0, 1),
@@ -39,7 +36,6 @@ NAMED_CONSTANT_BANK = tuple(sorted(NAMED_CONSTANT_TOKENS))
 LEAF_SHAPE = "leaf"
 UNARY_SHAPE = "unary"
 BINARY_SHAPE = "binary"
-NARY_SHAPE = "nary"
 NUMERIC_CONST_LEAF = "numeric_const"
 NAMED_CONST_LEAF = "named_const"
 VAR_LEAF = "var"
@@ -60,12 +56,11 @@ def production_family(node: Expr) -> str:
         return VAR_FAMILY
     if isinstance(node, UnaryOp):
         return UNARY_EXPR_FAMILY
-    if isinstance(node, NaryOp):
+    if isinstance(node, BinaryOp):
         if node.op == "add":
             return ADD_EXPR_FAMILY
         if node.op == "mul":
             return MUL_EXPR_FAMILY
-    if isinstance(node, BinaryOp):
         if node.op == "pow":
             return POW_EXPR_FAMILY
         if node.op == "div":
@@ -87,8 +82,6 @@ def node_shape(node: Expr) -> str:
         return UNARY_SHAPE
     if isinstance(node, BinaryOp):
         return BINARY_SHAPE
-    if isinstance(node, NaryOp):
-        return NARY_SHAPE
     raise TypeError(f"Unsupported expression type: {type(node).__name__}")
 
 
@@ -99,8 +92,6 @@ def node_arity(node: Expr) -> int:
         return 1
     if isinstance(node, BinaryOp):
         return 2
-    if isinstance(node, NaryOp):
-        return len(node.operands)
     raise TypeError(f"Unsupported expression type: {type(node).__name__}")
 
 
@@ -119,9 +110,6 @@ def local_replacement_candidates(node: Expr) -> tuple[LocalReplacementSpec, ...]
     if isinstance(node, BinaryOp):
         return _operator_replacement_candidates(node, shape=BINARY_SHAPE, operators=BINARY_OPERATORS)
 
-    if isinstance(node, NaryOp):
-        return _operator_replacement_candidates(node, shape=NARY_SHAPE, operators=NARY_OPERATORS)
-
     raise TypeError(f"Unsupported expression type: {type(node).__name__}")
 
 
@@ -134,8 +122,6 @@ def has_local_replacement(node: Expr) -> bool:
         return len(UNARY_OPERATORS) > 1
     if isinstance(node, BinaryOp):
         return len(BINARY_OPERATORS) > 1
-    if isinstance(node, NaryOp):
-        return len(NARY_OPERATORS) > 1
     raise TypeError(f"Unsupported expression type: {type(node).__name__}")
 
 
@@ -164,14 +150,6 @@ def can_locally_replace(node: Expr, candidate: Expr | LocalReplacementSpec) -> b
             and candidate != node
         )
 
-    if isinstance(node, NaryOp) and isinstance(candidate, NaryOp):
-        return (
-            candidate.op in NARY_OPERATORS
-            and len(candidate.operands) == len(node.operands)
-            and candidate.operands == node.operands
-            and candidate != node
-        )
-
     return False
 
 
@@ -193,9 +171,6 @@ def can_sampled_subtree_replace(node: Expr, candidate_subtree: Expr) -> bool:
         return candidate_subtree.op in UNARY_OPERATORS
 
     if isinstance(node, BinaryOp) and isinstance(candidate_subtree, BinaryOp):
-        return node.op == candidate_subtree.op
-
-    if isinstance(node, NaryOp) and isinstance(candidate_subtree, NaryOp):
         return node.op == candidate_subtree.op
 
     return True
@@ -232,14 +207,11 @@ def _can_locally_replace_spec(node: Expr, spec: LocalReplacementSpec) -> bool:
     if isinstance(node, BinaryOp):
         return spec.op in BINARY_OPERATORS and spec.op != node.op
 
-    if isinstance(node, NaryOp):
-        return spec.op in NARY_OPERATORS and spec.op != node.op
-
     return False
 
 
 def _operator_replacement_candidates(
-    node: UnaryOp | BinaryOp | NaryOp,
+    node: UnaryOp | BinaryOp,
     *,
     shape: str,
     operators: tuple[str, ...],

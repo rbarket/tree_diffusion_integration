@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fractions import Fraction
 
-from src.mathlang.ast import BinaryOp, Const, Expr, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
 from src.mathlang.grammar import NAMED_CONSTANT_TOKENS, SIGNED_INT_TOKENS, VARIABLE_TOKENS, is_binary_operator, is_unary_function, normalize_token
 
 
@@ -72,12 +72,6 @@ def _parse_expr(tokens: list[str], index: int) -> tuple[Expr, int]:
         operand, next_index = _parse_expr(tokens, index + 1)
         return UnaryOp(op=token, operand=operand, token_start=index, token_end=next_index), next_index
 
-    if token in {"add", "mul"}:
-        left, next_index = _parse_expr(tokens, index + 1)
-        right, end_index = _parse_expr(tokens, next_index)
-        operands = _collect_operands(token, left) + _collect_operands(token, right)
-        return NaryOp(op=token, operands=tuple(operands), token_start=index, token_end=end_index), end_index
-
     if is_binary_operator(token):
         left, next_index = _parse_expr(tokens, index + 1)
         right, end_index = _parse_expr(tokens, next_index)
@@ -110,9 +104,3 @@ def _parse_signed_int(tokens: list[str], index: int) -> tuple[Const, int]:
         value = -value
 
     return Const(value=Fraction(value, 1), token_start=index, token_end=next_index), next_index
-
-
-def _collect_operands(op: str, expr: Expr) -> list[Expr]:
-    if isinstance(expr, NaryOp) and expr.op == op:
-        return list(expr.operands)
-    return [expr]

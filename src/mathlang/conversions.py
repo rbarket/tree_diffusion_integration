@@ -10,7 +10,7 @@ from sympy.parsing.sympy_parser import (
     convert_xor,
 )
 
-from src.mathlang.ast import BinaryOp, Const, Expr, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
 from src.mathlang.parser import parse_prefix_tokens
 
 # ---------- SymPy parsing config ----------
@@ -158,7 +158,7 @@ def sympy_to_prefix(expr: sp.Expr) -> List[str]:
             return ["sqrt"] + sympy_to_prefix(base)
         return ["pow"] + sympy_to_prefix(base) + sympy_to_prefix(exp)
 
-    # add / mul (n-ary): left-associate like Lample/Charton
+    # add / mul: emit right-nested binary prefix like Lample/Charton
     if expr.func == sp.Add:
         args = list(expr.args)
         if len(args) == 1:
@@ -340,18 +340,14 @@ def ast_to_sympy(expr: Expr) -> sp.Expr:
         return unary_mapping[expr.op](ast_to_sympy(expr.operand))
 
     if isinstance(expr, BinaryOp):
+        if expr.op == "add":
+            return sp.Add(ast_to_sympy(expr.left), ast_to_sympy(expr.right))
+        if expr.op == "mul":
+            return sp.Mul(ast_to_sympy(expr.left), ast_to_sympy(expr.right))
         if expr.op == "pow":
             return sp.Pow(ast_to_sympy(expr.left), ast_to_sympy(expr.right))
         if expr.op == "div":
             return ast_to_sympy(expr.left) / ast_to_sympy(expr.right)
         raise ValueError(f"Unsupported binary operator: {expr.op}")
-
-    if isinstance(expr, NaryOp):
-        operands = [ast_to_sympy(operand) for operand in expr.operands]
-        if expr.op == "add":
-            return sp.Add(*operands)
-        if expr.op == "mul":
-            return sp.Mul(*operands)
-        raise ValueError(f"Unsupported n-ary operator: {expr.op}")
 
     raise TypeError(f"Unsupported AST node: {type(expr).__name__}")

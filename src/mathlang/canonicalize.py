@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fractions import Fraction
 
-from src.mathlang.ast import BinaryOp, Const, Expr, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
 from src.mathlang.grammar import is_commutative, normalize_token
 
 
@@ -37,9 +37,22 @@ def _canonicalize_node(expr: Expr) -> Expr:
         )
 
     if isinstance(expr, BinaryOp):
+        op = normalize_token(expr.op)
         left = _canonicalize_node(expr.left)
         right = _canonicalize_node(expr.right)
-        if expr.op == "div" and isinstance(left, Const) and isinstance(right, Const) and left.is_numeric and right.is_numeric:
+
+        if op in {"add", "mul"}:
+            terms = _flatten_binary_associative(op, left) + _flatten_binary_associative(op, right)
+            if is_commutative(op):
+                terms = sorted(terms, key=_structural_key)
+            return _build_right_nested(
+                op,
+                terms,
+                token_start=expr.token_start,
+                token_end=expr.token_end,
+            )
+
+        if op == "div" and isinstance(left, Const) and isinstance(right, Const) and left.is_numeric and right.is_numeric:
             if right.value != 0:
                 return Const(
                     value=left.value / right.value,
@@ -47,31 +60,9 @@ def _canonicalize_node(expr: Expr) -> Expr:
                     token_end=expr.token_end,
                 )
         return BinaryOp(
-            op=normalize_token(expr.op),
+            op=op,
             left=left,
             right=right,
-            token_start=expr.token_start,
-            token_end=expr.token_end,
-        )
-
-    if isinstance(expr, NaryOp):
-        operands: list[Expr] = []
-        for operand in expr.operands:
-            child = _canonicalize_node(operand)
-            if isinstance(child, NaryOp) and child.op == expr.op:
-                operands.extend(child.operands)
-            else:
-                operands.append(child)
-
-        if is_commutative(expr.op):
-            operands = sorted(operands, key=_structural_key)
-
-        if len(operands) == 1:
-            return operands[0]
-
-        return NaryOp(
-            op=normalize_token(expr.op),
-            operands=tuple(operands),
             token_start=expr.token_start,
             token_end=expr.token_end,
         )
@@ -90,25 +81,54 @@ def _structural_key(expr: Expr) -> tuple:
         return (3, expr.op, _structural_key(expr.operand))
     if isinstance(expr, BinaryOp):
         return (4, expr.op, _structural_key(expr.left), _structural_key(expr.right))
-    if isinstance(expr, NaryOp):
-        return (5, expr.op, tuple(_structural_key(operand) for operand in expr.operands))
     raise TypeError(f"Unsupported expression type: {type(expr).__name__}")
 
 
 def _strip_top_level_constants(expr: Expr, *, variable: str) -> Expr:
-    if not isinstance(expr, NaryOp) or expr.op != "add":
+    if not isinstance(expr, BinaryOp) or expr.op != "add":
         return expr
 
-    variable_terms = [operand for operand in expr.operands if operand.contains_var(variable)]
-    if not variable_terms or len(variable_terms) == len(expr.operands):
+    terms = _flatten_binary_associative("add", expr)
+    variable_terms = [term for term in terms if term.contains_var(variable)]
+    if not variable_terms or len(variable_terms) == len(terms):
         return expr
 
     if len(variable_terms) == 1:
         return variable_terms[0]
 
-    return NaryOp(
-        op="add",
-        operands=tuple(variable_terms),
+    return _build_right_nested(
+        "add",
+        variable_terms,
         token_start=expr.token_start,
         token_end=expr.token_end,
     )
+
+
+def _flatten_binary_associative(op: str, expr: Expr) -> list[Expr]:
+    if isinstance(expr, BinaryOp) and expr.op == op:
+        return _flatten_binary_associative(op, expr.left) + _flatten_binary_associative(op, expr.right)
+    return [expr]
+
+
+def _build_right_nested(
+    op: str,
+    terms: list[Expr],
+    *,
+    token_start: int | None = None,
+    token_end: int | None = None,
+) -> Expr:
+    if not terms:
+        raise ValueError("Cannot build a binary expression without terms.")
+    if len(terms) == 1:
+        return terms[0]
+
+    right: Expr = terms[-1]
+    for index in range(len(terms) - 2, -1, -1):
+        right = BinaryOp(
+            op=op,
+            left=terms[index],
+            right=right,
+            token_start=token_start if index == 0 else None,
+            token_end=token_end if index == 0 else None,
+        )
+    return right

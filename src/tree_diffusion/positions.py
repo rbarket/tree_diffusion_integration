@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.mathlang.ast import BinaryOp, Const, Expr, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
 from src.mathlang.serializer import serialize_prefix_tokens
 from src.tree_diffusion.mutation_grammar import has_local_replacement, production_family, subtree_size
 
@@ -46,8 +46,6 @@ def index_tree_positions(expr: Expr, sigma_small: int | None = None) -> Position
             length = 1 + token_length(node.operand)
         elif isinstance(node, BinaryOp):
             length = 1 + token_length(node.left) + token_length(node.right)
-        elif isinstance(node, NaryOp):
-            length = _nary_token_length(node.operands, token_length)
         else:
             raise TypeError(f"Unsupported expression type: {type(node).__name__}")
 
@@ -92,17 +90,6 @@ def index_tree_positions(expr: Expr, sigma_small: int | None = None) -> Position
             walk(node.right, parent_id=node_id, depth=depth + 1, cursor=right_cursor)
             return
 
-        if isinstance(node, NaryOp):
-            _walk_nary_operands(
-                node.operands,
-                parent_id=node_id,
-                depth=depth + 1,
-                cursor=cursor,
-                visit=walk,
-                token_length=token_length,
-            )
-            return
-
         raise TypeError(f"Unsupported expression type: {type(node).__name__}")
 
     walk(expr, parent_id=None, depth=0, cursor=0)
@@ -119,39 +106,6 @@ def _node_op(node: Expr) -> str | None:
         return node.symbol if node.is_named else "const"
     if isinstance(node, Var):
         return node.name
-    if isinstance(node, (UnaryOp, BinaryOp, NaryOp)):
+    if isinstance(node, (UnaryOp, BinaryOp)):
         return node.op
     return None
-
-
-def _nary_token_length(operands: tuple[Expr, ...], token_length) -> int:
-    if len(operands) == 2:
-        return 1 + token_length(operands[0]) + token_length(operands[1])
-    return 1 + token_length(operands[0]) + _nary_token_length(operands[1:], token_length)
-
-
-def _walk_nary_operands(
-    operands: tuple[Expr, ...],
-    *,
-    parent_id: int,
-    depth: int,
-    cursor: int,
-    visit,
-    token_length,
-) -> None:
-    first_cursor = cursor + 1
-    visit(operands[0], parent_id=parent_id, depth=depth, cursor=first_cursor)
-    if len(operands) == 2:
-        second_cursor = first_cursor + token_length(operands[0])
-        visit(operands[1], parent_id=parent_id, depth=depth, cursor=second_cursor)
-        return
-
-    rest_cursor = first_cursor + token_length(operands[0])
-    _walk_nary_operands(
-        operands[1:],
-        parent_id=parent_id,
-        depth=depth,
-        cursor=rest_cursor,
-        visit=visit,
-        token_length=token_length,
-    )

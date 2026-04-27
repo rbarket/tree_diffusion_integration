@@ -5,7 +5,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
-from src.mathlang.ast import BinaryOp, Const, Expr, NaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string, serialize_prefix_tokens
@@ -56,8 +56,8 @@ def hand_built_mutation_cases() -> tuple[tuple[str, Expr, int], ...]:
         ("leaf_only", canonical_expr("x"), 0),
         ("unary", canonical_expr("sin x"), 1),
         ("binary", canonical_expr("pow x INT+ 2"), 1),
-        ("nary_add", canonical_expr("add x add sin x pow x INT+ 2"), 2),
-        ("nary_mul", canonical_expr("mul x mul sin x pow x INT+ 2"), 2),
+        ("associative_add", canonical_expr("add x add sin x pow x INT+ 2"), 2),
+        ("associative_mul", canonical_expr("mul x mul sin x pow x INT+ 2"), 2),
         ("mixed", canonical_expr("add div sin x INT+ 2 add mul pow x INT+ 3 cos x ln x"), 3),
     )
 
@@ -128,9 +128,6 @@ def infer_possible_mutation_kinds(result: MutationResult) -> frozenset[str]:
         elif isinstance(original, UnaryOp) and isinstance(replacement, UnaryOp):
             possible.add(SAMPLED_SMALL_SUBTREE_REPLACEMENT)
         elif isinstance(original, BinaryOp) and isinstance(replacement, BinaryOp):
-            if replacement.op == original.op:
-                possible.add(SAMPLED_SMALL_SUBTREE_REPLACEMENT)
-        elif isinstance(original, NaryOp) and isinstance(replacement, NaryOp):
             if replacement.op == original.op:
                 possible.add(SAMPLED_SMALL_SUBTREE_REPLACEMENT)
 
