@@ -13,6 +13,65 @@ from sympy.parsing.sympy_parser import (
 from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
 from src.mathlang.parser import parse_prefix_tokens
 
+# ---------- Unary-function registries ----------
+_PREFIX_UNARY_TO_SYMPY = {
+    "abs": sp.Abs,
+    "acos": sp.acos,
+    "acosh": sp.acosh,
+    "acot": sp.acot,
+    "asin": sp.asin,
+    "asinh": sp.asinh,
+    "atan": sp.atan,
+    "atanh": sp.atanh,
+    "cos": sp.cos,
+    "cosh": sp.cosh,
+    "cot": sp.cot,
+    "coth": sp.coth,
+    "csc": sp.csc,
+    "csch": sp.csch,
+    "exp": sp.exp,
+    "ln": sp.log,
+    "sec": sp.sec,
+    "sech": sp.sech,
+    "sign": sp.sign,
+    "sin": sp.sin,
+    "sinh": sp.sinh,
+    "sqrt": sp.sqrt,
+    "tan": sp.tan,
+    "tanh": sp.tanh,
+}
+
+_EXTRA_LOCAL_DICT_ENTRIES = {
+    "ln": sp.log,
+    "log": sp.log,
+    "sec": sp.sec,
+    "csc": sp.csc,
+    "sech": sp.sech,
+    "csch": sp.csch,
+    "asec": sp.asec,
+    "acsc": sp.acsc,
+    "acoth": sp.acoth,
+    "asech": sp.asech,
+    "acsch": sp.acsch,
+}
+
+_SYMPY_UNARY_TO_PREFIX = {
+    sympy_func: token for token, sympy_func in _PREFIX_UNARY_TO_SYMPY.items()
+}
+_SYMPY_UNARY_TO_PREFIX.update(
+    {
+        sp.sec: "sec",
+        sp.csc: "csc",
+        sp.asec: "asec",
+        sp.acsc: "acsc",
+        sp.sech: "sech",
+        sp.csch: "csch",
+        sp.acoth: "acoth",
+        sp.asech: "asech",
+        sp.acsch: "acsch",
+    }
+)
+
 # ---------- SymPy parsing config ----------
 _TRANSFORMS = standard_transformations + (
     implicit_multiplication_application,
@@ -30,33 +89,8 @@ _LOCAL_DICT = {
     "Pi": sp.pi,
     "pi": sp.pi,
     # common function names
-    "ln": sp.log,
-    "log": sp.log,
-    "exp": sp.exp,
-    "sin": sp.sin,
-    "cos": sp.cos,
-    "tan": sp.tan,
-    "cot": sp.cot,
-    "sec": sp.sec,
-    "csc": sp.csc,
-    "sqrt": sp.sqrt,
-    "abs": sp.Abs,
-    # hyperbolic
-    "sinh": sp.sinh,
-    "cosh": sp.cosh,
-    "tanh": sp.tanh,
-    "coth": sp.coth,
-    "sech": sp.sech,
-    "csch": sp.csch,
-    # inverse trig/hyperbolic (if your infix uses these names)
-    "asin": sp.asin,
-    "acos": sp.acos,
-    "atan": sp.atan,
-    "acot": sp.acot,
-    "asinh": sp.asinh,
-    "acosh": sp.acosh,
-    "atanh": sp.atanh,
-    "acoth": sp.acoth,
+    **{token: func for token, func in _PREFIX_UNARY_TO_SYMPY.items() if token != "ln"},
+    **_EXTRA_LOCAL_DICT_ENTRIES,
 }
 
 
@@ -119,37 +153,8 @@ def sympy_to_prefix(expr: sp.Expr) -> List[str]:
         return ["I"]
 
     # unary functions
-    unary = {
-        sp.exp: "exp",
-        sp.log: "ln",
-        sp.Abs: "abs",
-        sp.sin: "sin",
-        sp.cos: "cos",
-        sp.tan: "tan",
-        sp.cot: "cot",
-        sp.sec: "sec",
-        sp.csc: "csc",
-        sp.asin: "asin",
-        sp.acos: "acos",
-        sp.atan: "atan",
-        sp.acot: "acot",
-        sp.asec: "asec",
-        sp.acsc: "acsc",
-        sp.sinh: "sinh",
-        sp.cosh: "cosh",
-        sp.tanh: "tanh",
-        sp.coth: "coth",
-        sp.sech: "sech",
-        sp.csch: "csch",
-        sp.asinh: "asinh",
-        sp.acosh: "acosh",
-        sp.atanh: "atanh",
-        sp.acoth: "acoth",
-        sp.asech: "asech",
-        sp.acsch: "acsch",
-    }
-    if expr.func in unary:
-        return [unary[expr.func]] + sympy_to_prefix(expr.args[0])
+    if expr.func in _SYMPY_UNARY_TO_PREFIX:
+        return [_SYMPY_UNARY_TO_PREFIX[expr.func]] + sympy_to_prefix(expr.args[0])
 
     # power
     if expr.func == sp.Pow:
@@ -191,6 +196,7 @@ def infix_to_prefix_tokens(s: str) -> List[str]:
 # ---------- prefix -> infix (minimal, for later verification/debug) ----------
 _UNARY_TOKENS = {
     "exp", "ln", "abs",
+    "sign",
     "sin", "cos", "tan", "cot", "sec", "csc",
     "asin", "acos", "atan", "acot", "asec", "acsc",
     "sinh", "cosh", "tanh", "coth", "sech", "csch",
@@ -299,6 +305,10 @@ def prefix_tokens_to_sympy(tokens: List[str]) -> sp.Expr:
     return ast_to_sympy(parse_prefix_tokens(list(tokens)))
 
 
+def sympy_to_ast(expr: sp.Expr) -> Expr:
+    return parse_prefix_tokens(sympy_to_prefix(expr))
+
+
 def ast_to_sympy(expr: Expr) -> sp.Expr:
     if isinstance(expr, Const):
         if expr.is_named:
@@ -316,28 +326,7 @@ def ast_to_sympy(expr: Expr) -> sp.Expr:
         return sp.Symbol(expr.name, real=True)
 
     if isinstance(expr, UnaryOp):
-        unary_mapping = {
-            "abs": sp.Abs,
-            "acos": sp.acos,
-            "acosh": sp.acosh,
-            "acot": sp.acot,
-            "asin": sp.asin,
-            "asinh": sp.asinh,
-            "atan": sp.atan,
-            "atanh": sp.atanh,
-            "cos": sp.cos,
-            "cosh": sp.cosh,
-            "cot": sp.cot,
-            "coth": sp.coth,
-            "exp": sp.exp,
-            "ln": sp.log,
-            "sin": sp.sin,
-            "sinh": sp.sinh,
-            "sqrt": sp.sqrt,
-            "tan": sp.tan,
-            "tanh": sp.tanh,
-        }
-        return unary_mapping[expr.op](ast_to_sympy(expr.operand))
+        return _PREFIX_UNARY_TO_SYMPY[expr.op](ast_to_sympy(expr.operand))
 
     if isinstance(expr, BinaryOp):
         if expr.op == "add":

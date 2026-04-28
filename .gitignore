@@ -1,12 +1,25 @@
-/data/
-/artifacts/
+*
+!/.gitignore
+!/README.md
+!/pyproject.toml
+!/uv.lock
+!/config/
+!/config/**
+!/src/
+!/src/**
+!/tests/
+!/tests/**
+!/notebooks/
+!/notebooks/mutation_walkthrough.ipynb
 
 __pycache__/
 *.py[cod]
-
-/.venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.ipynb_checkpoints/
 
+/.venv/
 *.egg-info/
+/data/
+/artifacts/
