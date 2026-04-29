@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Sequence
 
 import sympy as sp
@@ -11,20 +12,34 @@ from src.mathlang.conversions import ast_to_sympy, sympy_to_ast
 from src.mathlang.serializer import serialize_prefix_tokens
 
 
-DEFAULT_PROBE_POINTS: tuple[float, ...] = (-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0)
+DEFAULT_PROBE_POINTS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 3.0, 5.0)
 RESIDUAL_MODES = frozenset({"none", "symbolic", "numeric", "both"})
 _NO_STRIP_VARIABLE = "__observation_no_strip__"
+_DEFAULT_COMPLEX_TOLERANCE = 1e-10
 
 
 @dataclass(frozen=True)
 class NumericProbeFeatures:
     probe_points: tuple[float, ...]
-    residual_values: tuple[float | None, ...]
+    residual_real: tuple[float | None, ...]
+    residual_imag: tuple[float | None, ...]
+    residual_abs: tuple[float | None, ...]
+    residual_abs_squared: tuple[float | None, ...]
     finite_mask: tuple[bool, ...]
+    complex_mask: tuple[bool, ...]
     mean_abs_residual: float | None
-    mean_squared_residual: float | None
+    mean_squared_abs_residual: float | None
     max_abs_residual: float | None
     fraction_finite: float
+    fraction_complex: float
+
+    @property
+    def residual_values(self) -> tuple[float | None, ...]:
+        return self.residual_real
+
+    @property
+    def mean_squared_residual(self) -> float | None:
+        return self.mean_squared_abs_residual
 
 
 @dataclass(frozen=True)
@@ -75,8 +90,9 @@ def compute_numeric_probes(
 ) -> NumericProbeFeatures:
     current_derivative_sym = ast_to_sympy(current_derivative)
     target_integrand_sym = ast_to_sympy(target_integrand)
+    residual_sym = current_derivative_sym - target_integrand_sym
     return _compute_numeric_probes_from_sympy(
-        current_derivative_sym - target_integrand_sym,
+        residual_sym,
         probe_points=probe_points,
         var=var,
     )
@@ -172,6 +188,10 @@ def build_observation(
                 warnings.append(
                     f"numeric_probe_nonfinite:{nonfinite_count}/{len(numeric_probes.probe_points)}"
                 )
+            if numeric_probes.fraction_complex > 0.0:
+                warnings.append(
+                    f"numeric_probe_complex:{sum(numeric_probes.complex_mask)}/{sum(numeric_probes.finite_mask)}"
+                )
         except Exception as exc:
             warnings.append(f"numeric_probe_failed:{type(exc).__name__}")
 
@@ -229,42 +249,69 @@ def _compute_numeric_probes_from_sympy(
     points = tuple(float(point) for point in raw_points)
     variable = sp.Symbol(var, real=True)
 
-    residual_values: list[float | None] = []
+    residual_real: list[float | None] = []
+    residual_imag: list[float | None] = []
+    residual_abs: list[float | None] = []
+    residual_abs_squared: list[float | None] = []
     finite_mask: list[bool] = []
+    complex_mask: list[bool] = []
 
     for point in points:
         try:
-            evaluated = sp.N(residual_sym.subs(variable, point))
-            if evaluated.is_real is not True or evaluated.is_finite is not True:
-                raise ValueError("non-finite-or-non-real")
-            residual_value = float(evaluated)
+            try:
+                substitution_value: sp.Expr = sp.Rational(str(point))
+            except Exception:
+                substitution_value = sp.Float(point)
+            evaluated = sp.N(residual_sym.subs(variable, substitution_value))
+            residual_value = complex(evaluated)
+            real_part = float(residual_value.real)
+            imag_part = float(residual_value.imag)
+            if not math.isfinite(real_part) or not math.isfinite(imag_part):
+                raise ValueError("non-finite")
+            abs_squared = (real_part * real_part) + (imag_part * imag_part)
+            abs_value = math.sqrt(abs_squared)
         except Exception:
-            residual_values.append(None)
+            residual_real.append(None)
+            residual_imag.append(None)
+            residual_abs.append(None)
+            residual_abs_squared.append(None)
             finite_mask.append(False)
+            complex_mask.append(False)
             continue
 
-        residual_values.append(residual_value)
+        residual_real.append(real_part)
+        residual_imag.append(imag_part)
+        residual_abs.append(abs_value)
+        residual_abs_squared.append(abs_squared)
         finite_mask.append(True)
+        complex_mask.append(abs(imag_part) > _DEFAULT_COMPLEX_TOLERANCE)
 
-    finite_values = [value for value in residual_values if value is not None]
-    if finite_values:
-        abs_values = [abs(value) for value in finite_values]
-        mean_abs_residual = sum(abs_values) / len(abs_values)
-        mean_squared_residual = sum(value * value for value in finite_values) / len(finite_values)
-        max_abs_residual = max(abs_values)
+    finite_abs_values = [value for value in residual_abs if value is not None]
+    finite_abs_squared_values = [value for value in residual_abs_squared if value is not None]
+    finite_count = sum(finite_mask)
+    complex_finite_count = sum(complex_mask)
+    if finite_abs_values:
+        mean_abs_residual = sum(finite_abs_values) / len(finite_abs_values)
+        mean_squared_abs_residual = sum(finite_abs_squared_values) / len(finite_abs_squared_values)
+        max_abs_residual = max(finite_abs_values)
     else:
         mean_abs_residual = None
-        mean_squared_residual = None
+        mean_squared_abs_residual = None
         max_abs_residual = None
 
     return NumericProbeFeatures(
         probe_points=points,
-        residual_values=tuple(residual_values),
+        residual_real=tuple(residual_real),
+        residual_imag=tuple(residual_imag),
+        residual_abs=tuple(residual_abs),
+        residual_abs_squared=tuple(residual_abs_squared),
         finite_mask=tuple(finite_mask),
+        complex_mask=tuple(complex_mask),
         mean_abs_residual=mean_abs_residual,
-        mean_squared_residual=mean_squared_residual,
+        mean_squared_abs_residual=mean_squared_abs_residual,
         max_abs_residual=max_abs_residual,
-        fraction_finite=(len(finite_values) / len(points)) if points else 0.0,
+        fraction_finite=(finite_count / len(points)) if points else 0.0,
+        fraction_complex=(complex_finite_count / finite_count) if finite_count else 0.0,
     )
 
 

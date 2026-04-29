@@ -20,10 +20,10 @@ from src.tree_diffusion.mutation_grammar import (
     POW_EXPR_FAMILY,
     UNARY_EXPR_FAMILY,
     UNARY_OPERATORS,
+    VAR_FAMILY,
     VAR_LEAF,
     can_locally_replace,
     can_sampled_subtree_replace,
-    compatible_replacement_families,
     has_local_replacement,
     local_replacement_candidates,
 )
@@ -39,6 +39,7 @@ class MutationResult:
     mutated_expr: Expr
     selected_node_id: int
     selected_family: str
+    mutation_kind: str
     original_subtree: Expr
     replacement_subtree: Expr
     selected_token_start: int
@@ -59,7 +60,7 @@ def sample_valid_subtree(family: str, sigma_small: int, rng: random.Random) -> E
         return _sample_expr(sigma_small, rng)
     if family == CONST_FAMILY:
         return _sample_any_const(rng)
-    if family == "VAR":
+    if family == VAR_FAMILY:
         return Var(name="x")
     if family == UNARY_EXPR_FAMILY:
         if sigma_small < 1:
@@ -84,6 +85,18 @@ def sample_valid_subtree(family: str, sigma_small: int, rng: random.Random) -> E
         return _sample_div_expr(sigma_small, rng)
 
     raise ValueError(f"Unsupported family: {family}")
+
+
+def sample_random_expr(
+    *,
+    rng: random.Random | None = None,
+    max_size: int = 4,
+) -> Expr:
+    if max_size < 0:
+        raise ValueError("max_size must be non-negative.")
+
+    rng = rng or random.Random()
+    return canonicalize(sample_valid_subtree(EXPR_FAMILY, max_size, rng))
 
 
 def mutate_once(
@@ -117,6 +130,7 @@ def mutate_once(
                 selected_position,
                 original_subtree,
                 replacement,
+                mutation_kind=LOCAL_CONST_EDIT,
             )
             if result is not None:
                 return result
@@ -133,7 +147,7 @@ def mutate_once(
                 return result
             continue
 
-        replacement = sample_valid_subtree(family, sigma_small, rng)
+        replacement = sample_valid_subtree(EXPR_FAMILY, sigma_small, rng)
         if not can_sampled_subtree_replace(original_subtree, replacement):
             continue
         if replacement == original_subtree:
@@ -143,6 +157,7 @@ def mutate_once(
             selected_position,
             original_subtree,
             replacement,
+            mutation_kind=SAMPLED_SMALL_SUBTREE_REPLACEMENT,
         )
         if result is not None:
             return result
@@ -222,7 +237,7 @@ def _sample_expr(sigma_small: int, rng: random.Random) -> Expr:
 
     families = [
         CONST_FAMILY,
-        "VAR",
+        VAR_FAMILY,
         UNARY_EXPR_FAMILY,
         ADD_EXPR_FAMILY,
         MUL_EXPR_FAMILY,
@@ -233,7 +248,7 @@ def _sample_expr(sigma_small: int, rng: random.Random) -> Expr:
     family = rng.choices(families, weights=weights, k=1)[0]
     if family == CONST_FAMILY:
         return _sample_any_const(rng)
-    if family == "VAR":
+    if family == VAR_FAMILY:
         return Var(name="x")
     return sample_valid_subtree(family, sigma_small, rng)
 
@@ -310,14 +325,14 @@ def _sample_mutation_kind(node: Expr, rng: random.Random) -> str | None:
         kinds.append(LOCAL_CONST_EDIT)
         if has_local_replacement(node):
             kinds.append(LOCAL_SAME_ARITY_REPLACEMENT)
-    elif isinstance(node, Var):
+    if isinstance(node, Var):
         if has_local_replacement(node):
             kinds.append(LOCAL_SAME_ARITY_REPLACEMENT)
-    elif isinstance(node, (UnaryOp, BinaryOp)):
+    if isinstance(node, (UnaryOp, BinaryOp)):
         if has_local_replacement(node):
             kinds.append(LOCAL_SAME_ARITY_REPLACEMENT)
-        if compatible_replacement_families(node):
-            kinds.append(SAMPLED_SMALL_SUBTREE_REPLACEMENT)
+    if isinstance(node, (Const, Var, UnaryOp, BinaryOp)):
+        kinds.append(SAMPLED_SMALL_SUBTREE_REPLACEMENT)
 
     if not kinds:
         return None
@@ -345,6 +360,7 @@ def _local_replace_selected_node(
             selected_position,
             original_subtree,
             replacement,
+            mutation_kind=LOCAL_SAME_ARITY_REPLACEMENT,
         )
         if result is not None:
             return result
@@ -388,6 +404,8 @@ def _apply_replacement(
     selected_position: NodePosition,
     original_subtree: Expr,
     replacement: Expr,
+    *,
+    mutation_kind: str,
 ) -> MutationResult | None:
     mutated_expr = replace_subtree_by_node_id(canonical_expr, selected_position.node_id, replacement)
     canonical_mutated = canonicalize(mutated_expr)
@@ -398,6 +416,7 @@ def _apply_replacement(
         mutated_expr=canonical_mutated,
         selected_node_id=selected_position.node_id,
         selected_family=selected_position.production_family,
+        mutation_kind=mutation_kind,
         original_subtree=original_subtree,
         replacement_subtree=replacement,
         selected_token_start=selected_position.token_start,

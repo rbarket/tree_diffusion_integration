@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "pandas",
     "pyarrow",
+    "pytest>=9.0.3",
     "sympy",
     "torch",
 ]

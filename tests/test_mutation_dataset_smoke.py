@@ -3,7 +3,12 @@ from __future__ import annotations
 import random
 import unittest
 
-from src.tree_diffusion.mutation import mutate_once
+from src.tree_diffusion.mutation import (
+    LOCAL_CONST_EDIT,
+    LOCAL_SAME_ARITY_REPLACEMENT,
+    SAMPLED_SMALL_SUBTREE_REPLACEMENT,
+    mutate_once,
+)
 from tests.mutation_test_utils import DATASET_PATH, canonical_expr, load_dataset_expressions, validate_mutation_result
 
 
@@ -22,6 +27,7 @@ class MutationDatasetSmokeTests(unittest.TestCase):
     def test_processed_dataset_sample_mutates_without_crashing(self) -> None:
         local_like_hits = 0
         subtree_hits = 0
+        cross_shape_subtree_hits = 0
         successful_mutations = 0
         total_mutations = len(self.expressions) * MUTATIONS_PER_EXAMPLE
 
@@ -34,11 +40,28 @@ class MutationDatasetSmokeTests(unittest.TestCase):
                     result = mutate_once(current, sigma_small=SIGMA_SMALL, rng=rng)
                     validated = validate_mutation_result(self, current, result, sigma_small=SIGMA_SMALL)
                     successful_mutations += 1
-                    local_like_hits += int(validated.has_local_like_kind)
-                    subtree_hits += int(validated.has_subtree_kind)
                     assert result is not None
+                    local_like_hits += int(
+                        result.mutation_kind in {LOCAL_CONST_EDIT, LOCAL_SAME_ARITY_REPLACEMENT}
+                    )
+                    subtree_hits += int(result.mutation_kind == SAMPLED_SMALL_SUBTREE_REPLACEMENT)
+                    cross_shape_subtree_hits += int(
+                        result.mutation_kind == SAMPLED_SMALL_SUBTREE_REPLACEMENT
+                        and _root_signature(result.original_subtree) != _root_signature(result.replacement_subtree)
+                    )
                     current = result.mutated_expr
 
         self.assertEqual(successful_mutations, total_mutations)
         self.assertGreater(local_like_hits, 0)
         self.assertGreater(subtree_hits, 0)
+        self.assertGreater(cross_shape_subtree_hits, 0)
+
+
+def _root_signature(expr) -> tuple[str, str]:
+    if hasattr(expr, "op"):
+        return (type(expr).__name__, getattr(expr, "op"))
+    if hasattr(expr, "name"):
+        return (type(expr).__name__, getattr(expr, "name"))
+    if getattr(expr, "is_named", False):
+        return (type(expr).__name__, getattr(expr, "symbol"))
+    return (type(expr).__name__, "const")

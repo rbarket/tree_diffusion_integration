@@ -83,6 +83,7 @@ class MutationGrammarTests(unittest.TestCase):
         self.assertTrue(can_locally_replace(parse_prefix_string("sin x"), parse_prefix_string("cos x")))
         self.assertTrue(can_locally_replace(parse_prefix_string("exp x"), parse_prefix_string("ln x")))
         self.assertFalse(can_locally_replace(parse_prefix_string("sin x"), parse_prefix_string("pow x INT+ 2")))
+        self.assertFalse(can_locally_replace(parse_prefix_string("sin x"), parse_prefix_string("div x INT+ 2")))
         self.assertTrue(can_replace(parse_prefix_string("sin x"), parse_prefix_string("cos x")))
 
     def test_binary_local_replacements_require_binary_shape(self) -> None:
@@ -113,12 +114,15 @@ class MutationGrammarTests(unittest.TestCase):
     def test_identical_or_cross_shape_local_replacements_are_rejected(self) -> None:
         self.assertFalse(can_locally_replace(parse_prefix_string("sin x"), parse_prefix_string("sin x")))
         self.assertFalse(can_locally_replace(parse_prefix_string("pow x INT+ 2"), parse_prefix_string("INT+ 2")))
+        self.assertFalse(can_locally_replace(parse_prefix_string("x"), parse_prefix_string("add x INT+ 1")))
+        self.assertFalse(can_locally_replace(parse_prefix_string("INT+ 2"), parse_prefix_string("exp x")))
         self.assertFalse(can_locally_replace(parse_prefix_string("add x INT+ 1"), parse_prefix_string("sin x")))
 
-    def test_subtree_replacement_still_allows_broader_shape_changes_inside_subtree(self) -> None:
-        expr = parse_prefix_string("pow x sin x")
-        candidate = parse_prefix_string("pow x add x INT+ 1")
-        self.assertTrue(can_sampled_subtree_replace(expr, candidate))
+    def test_sampled_subtree_replacement_allows_cross_shape_expr_replacements(self) -> None:
+        self.assertTrue(can_sampled_subtree_replace(parse_prefix_string("pow x INT+ 2"), parse_prefix_string("sin x")))
+        self.assertTrue(can_sampled_subtree_replace(parse_prefix_string("sin x"), parse_prefix_string("div x INT+ 2")))
+        self.assertTrue(can_sampled_subtree_replace(parse_prefix_string("x"), parse_prefix_string("add x INT+ 1")))
+        self.assertTrue(can_sampled_subtree_replace(parse_prefix_string("INT+ 2"), parse_prefix_string("exp x")))
 
     def test_subtree_size_counts_operator_nodes_only(self) -> None:
         expr = parse_prefix_string("add sin x pow x INT+ 2")

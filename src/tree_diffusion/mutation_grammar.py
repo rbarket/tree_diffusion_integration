@@ -154,26 +154,7 @@ def can_locally_replace(node: Expr, candidate: Expr | LocalReplacementSpec) -> b
 
 
 def can_sampled_subtree_replace(node: Expr, candidate_subtree: Expr) -> bool:
-    if production_family(candidate_subtree) not in compatible_replacement_families(node):
-        return False
-
-    if isinstance(node, Const):
-        if not isinstance(candidate_subtree, Const):
-            return False
-        if node.is_numeric:
-            return candidate_subtree.is_numeric
-        return candidate_subtree.is_named
-
-    if isinstance(node, Var):
-        return False
-
-    if isinstance(node, UnaryOp) and isinstance(candidate_subtree, UnaryOp):
-        return candidate_subtree.op in UNARY_OPERATORS
-
-    if isinstance(node, BinaryOp) and isinstance(candidate_subtree, BinaryOp):
-        return node.op == candidate_subtree.op
-
-    return True
+    return _is_supported_expr(node) and _is_supported_expr(candidate_subtree)
 
 
 def can_replace(node: Expr, candidate_subtree: Expr) -> bool:
@@ -222,3 +203,23 @@ def _operator_replacement_candidates(
         for spec in (LocalReplacementSpec(shape=shape, op=op, child_count=child_count) for op in operators)
         if can_locally_replace(node, spec)
     )
+
+
+def _is_supported_expr(node: Expr) -> bool:
+    if isinstance(node, Const):
+        return node.is_numeric or (node.is_named and node.symbol in NAMED_CONSTANT_BANK)
+
+    if isinstance(node, Var):
+        return node.name == "x"
+
+    if isinstance(node, UnaryOp):
+        return node.op in UNARY_OPERATORS and _is_supported_expr(node.operand)
+
+    if isinstance(node, BinaryOp):
+        return (
+            node.op in BINARY_OPERATORS
+            and _is_supported_expr(node.left)
+            and _is_supported_expr(node.right)
+        )
+
+    return False

@@ -28,10 +28,10 @@ class SubtreeReplacementTests(unittest.TestCase):
         assert result is not None
 
         self.assertEqual(result.selected_node_id, 0)
-        self.assertEqual(validated.possible_kinds, frozenset({SAMPLED_SMALL_SUBTREE_REPLACEMENT}))
+        self.assertEqual(result.mutation_kind, SAMPLED_SMALL_SUBTREE_REPLACEMENT)
         self.assertFalse(can_locally_replace(result.original_subtree, result.replacement_subtree))
         self.assertTrue(can_sampled_subtree_replace(result.original_subtree, result.replacement_subtree))
-        self.assertIsInstance(result.replacement_subtree, UnaryOp)
+        self.assertTrue(validated.has_subtree_kind)
 
     def test_mutate_once_can_do_binary_subtree_replacement_at_the_root(self) -> None:
         expr = canonical_expr("pow x INT+ 2")
@@ -42,25 +42,25 @@ class SubtreeReplacementTests(unittest.TestCase):
         assert result is not None
 
         self.assertEqual(result.selected_node_id, 0)
-        self.assertEqual(validated.possible_kinds, frozenset({SAMPLED_SMALL_SUBTREE_REPLACEMENT}))
+        self.assertEqual(result.mutation_kind, SAMPLED_SMALL_SUBTREE_REPLACEMENT)
         self.assertFalse(can_locally_replace(result.original_subtree, result.replacement_subtree))
         self.assertTrue(can_sampled_subtree_replace(result.original_subtree, result.replacement_subtree))
-        self.assertIsInstance(result.replacement_subtree, BinaryOp)
+        self.assertTrue(validated.has_subtree_kind)
 
-    def test_mutate_once_can_do_add_mul_binary_subtree_replacement(self) -> None:
-        expr = canonical_expr("mul x mul sin x pow x INT+ 2")
-        sigma_small = 3
+    def test_cross_shape_subtree_replacements_are_legal_while_local_replacements_are_not(self) -> None:
+        cases = (
+            ("pow x INT+ 2", "sin x"),
+            ("sin x", "div x INT+ 2"),
+            ("x", "add x INT+ 1"),
+            ("INT+ 2", "exp x"),
+        )
 
-        result = mutate_once(expr, sigma_small=sigma_small, rng=random.Random(1))
-        validated = validate_mutation_result(self, expr, result, sigma_small=sigma_small)
-        assert result is not None
-
-        self.assertEqual(result.selected_family, "MUL_EXPR")
-        self.assertEqual(validated.possible_kinds, frozenset({SAMPLED_SMALL_SUBTREE_REPLACEMENT}))
-        self.assertFalse(can_locally_replace(result.original_subtree, result.replacement_subtree))
-        self.assertTrue(can_sampled_subtree_replace(result.original_subtree, result.replacement_subtree))
-        self.assertIsInstance(result.replacement_subtree, BinaryOp)
-        self.assertEqual(result.original_subtree.op, result.replacement_subtree.op)
+        for original_expression, replacement_expression in cases:
+            with self.subTest(original=original_expression, replacement=replacement_expression):
+                original = parse_prefix_string(original_expression)
+                replacement = parse_prefix_string(replacement_expression)
+                self.assertTrue(can_sampled_subtree_replace(original, replacement))
+                self.assertFalse(can_locally_replace(original, replacement))
 
     def test_manual_sampled_subtree_replacement_roundtrips_for_a_non_root_subtree(self) -> None:
         expr = canonical_expr("add div sin x INT+ 2 add mul pow x INT+ 3 cos x ln x")
@@ -69,9 +69,9 @@ class SubtreeReplacementTests(unittest.TestCase):
         index = index_tree_positions(expr, sigma_small=sigma_small)
         selected_position = index.positions[selected_node_id]
 
-        replacement = sample_valid_subtree("DIV_EXPR", sigma_small=2, rng=random.Random(2))
+        replacement = parse_prefix_string("sin x")
         self.assertLessEqual(selected_position.subtree_size, sigma_small)
-        self.assertLessEqual(subtree_size(replacement), 2)
+        self.assertLessEqual(subtree_size(replacement), 1)
         self.assertTrue(can_sampled_subtree_replace(index.node_id_to_node[selected_node_id], replacement))
         self.assertFalse(can_locally_replace(index.node_id_to_node[selected_node_id], replacement))
         self.assertNotEqual(index.node_id_to_node[selected_node_id], replacement)
@@ -80,10 +80,7 @@ class SubtreeReplacementTests(unittest.TestCase):
         serialized = serialize_prefix_string(mutated)
         self.assertEqual(mutated, canonicalize(parse_prefix_string(serialized)))
 
-    def test_var_leaf_to_non_leaf_subtree_replacement_is_rejected_in_current_design(self) -> None:
-        self.assertFalse(
-            can_sampled_subtree_replace(
-                Var(name="x"),
-                sample_valid_subtree("UNARY_EXPR", sigma_small=1, rng=random.Random(2)),
-            )
-        )
+    def test_var_leaf_to_non_leaf_subtree_replacement_is_now_legal(self) -> None:
+        replacement = sample_valid_subtree("UNARY_EXPR", sigma_small=1, rng=random.Random(2))
+        self.assertTrue(can_sampled_subtree_replace(Var(name="x"), replacement))
+        self.assertFalse(can_locally_replace(Var(name="x"), replacement))

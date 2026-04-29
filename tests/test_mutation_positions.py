@@ -21,7 +21,10 @@ class MutationPositionTests(unittest.TestCase):
             validated.post_index.node_id_to_span[0],
             (result.selected_token_start, result.selected_token_end),
         )
-        self.assertEqual(validated.post_index.node_id_to_span[0], (0, 3))
+        self.assertEqual(
+            validated.post_index.node_id_to_span[0],
+            (0, len(validated.post_index.serialized_tokens)),
+        )
 
     def test_reindex_after_deepest_leaf_mutation_matches_current_serialization(self) -> None:
         expr = canonical_expr("add div sin x INT+ 2 add mul pow x INT+ 3 cos x ln x")

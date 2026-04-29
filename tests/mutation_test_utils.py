@@ -5,7 +5,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
-from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
+from src.mathlang.ast import Const, Expr
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string, serialize_prefix_tokens
@@ -15,7 +15,7 @@ from src.tree_diffusion.mutation import (
     MutationResult,
     SAMPLED_SMALL_SUBTREE_REPLACEMENT,
 )
-from src.tree_diffusion.mutation_grammar import can_locally_replace, can_sampled_subtree_replace
+from src.tree_diffusion.mutation_grammar import can_locally_replace, can_sampled_subtree_replace, subtree_size
 from src.tree_diffusion.positions import NodePosition, PositionIndex, index_tree_positions
 
 
@@ -30,15 +30,15 @@ class ValidatedMutation:
     pre_position: NodePosition
     serialized_mutated: str
     reparsed_mutated: Expr
-    possible_kinds: frozenset[str]
+    mutation_kind: str
 
     @property
     def has_local_like_kind(self) -> bool:
-        return bool({LOCAL_CONST_EDIT, LOCAL_SAME_ARITY_REPLACEMENT} & self.possible_kinds)
+        return self.mutation_kind in {LOCAL_CONST_EDIT, LOCAL_SAME_ARITY_REPLACEMENT}
 
     @property
     def has_subtree_kind(self) -> bool:
-        return SAMPLED_SMALL_SUBTREE_REPLACEMENT in self.possible_kinds
+        return self.mutation_kind == SAMPLED_SMALL_SUBTREE_REPLACEMENT
 
 
 def canonical_expr(expression: str | Expr) -> Expr:
@@ -105,35 +105,6 @@ def first_node_id(
     raise LookupError("No matching node found.")
 
 
-def infer_possible_mutation_kinds(result: MutationResult) -> frozenset[str]:
-    original = result.original_subtree
-    replacement = result.replacement_subtree
-    possible: set[str] = set()
-
-    if replacement == original:
-        return frozenset()
-
-    if can_locally_replace(original, replacement):
-        if isinstance(original, Const):
-            if isinstance(replacement, Const) and _same_const_leaf_kind(original, replacement):
-                possible.add(LOCAL_CONST_EDIT)
-            possible.add(LOCAL_SAME_ARITY_REPLACEMENT)
-        else:
-            possible.add(LOCAL_SAME_ARITY_REPLACEMENT)
-
-    if can_sampled_subtree_replace(original, replacement):
-        if isinstance(original, Const) and isinstance(replacement, Const):
-            if _same_const_leaf_kind(original, replacement):
-                possible.add(SAMPLED_SMALL_SUBTREE_REPLACEMENT)
-        elif isinstance(original, UnaryOp) and isinstance(replacement, UnaryOp):
-            possible.add(SAMPLED_SMALL_SUBTREE_REPLACEMENT)
-        elif isinstance(original, BinaryOp) and isinstance(replacement, BinaryOp):
-            if replacement.op == original.op:
-                possible.add(SAMPLED_SMALL_SUBTREE_REPLACEMENT)
-
-    return frozenset(possible)
-
-
 def validate_mutation_result(
     testcase,
     source_expr: Expr | str,
@@ -157,6 +128,10 @@ def validate_mutation_result(
     testcase.assertEqual(pre_position.token_end, result.selected_token_end)
     testcase.assertNotEqual(result.original_subtree, result.replacement_subtree)
     testcase.assertNotEqual(canonical_source, result.mutated_expr)
+    testcase.assertIn(
+        result.mutation_kind,
+        {LOCAL_CONST_EDIT, LOCAL_SAME_ARITY_REPLACEMENT, SAMPLED_SMALL_SUBTREE_REPLACEMENT},
+    )
 
     if sigma_small is not None:
         testcase.assertLessEqual(pre_position.subtree_size, sigma_small)
@@ -175,15 +150,17 @@ def validate_mutation_result(
     post_index = index_tree_positions(result.mutated_expr)
     assert_index_spans_match(testcase, post_index)
 
-    possible_kinds = infer_possible_mutation_kinds(result)
-    testcase.assertTrue(
-        possible_kinds,
-        msg=(
-            "Mutation metadata did not admit any consistent local/subtree classification: "
-            f"original={serialize_prefix_string(result.original_subtree)!r} "
-            f"replacement={serialize_prefix_string(result.replacement_subtree)!r}"
-        ),
-    )
+    if result.mutation_kind == LOCAL_CONST_EDIT:
+        testcase.assertIsInstance(result.original_subtree, Const)
+        testcase.assertIsInstance(result.replacement_subtree, Const)
+        testcase.assertTrue(_same_const_leaf_kind(result.original_subtree, result.replacement_subtree))
+        testcase.assertTrue(can_locally_replace(result.original_subtree, result.replacement_subtree))
+    elif result.mutation_kind == LOCAL_SAME_ARITY_REPLACEMENT:
+        testcase.assertTrue(can_locally_replace(result.original_subtree, result.replacement_subtree))
+    else:
+        if sigma_small is not None:
+            testcase.assertLessEqual(subtree_size(result.replacement_subtree), sigma_small)
+        testcase.assertTrue(can_sampled_subtree_replace(result.original_subtree, result.replacement_subtree))
 
     return ValidatedMutation(
         source_expr=canonical_source,
@@ -192,7 +169,7 @@ def validate_mutation_result(
         pre_position=pre_position,
         serialized_mutated=serialized_mutated,
         reparsed_mutated=reparsed_mutated,
-        possible_kinds=possible_kinds,
+        mutation_kind=result.mutation_kind,
     )
 
 

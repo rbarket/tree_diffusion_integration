@@ -104,7 +104,22 @@ class EditPathTests(unittest.TestCase):
         self.assertEqual(edit.replacement_subtree, target)
         self.assertEqual(edit.resulting_tree, target)
 
-    def test_oversized_target_uses_legal_intermediate_that_moves_closer(self) -> None:
+    def test_cross_shape_small_target_uses_direct_sampled_subtree_replacement(self) -> None:
+        current = canonical_expr("sin x")
+        target = canonical_expr("div x INT+ 2")
+
+        edit = first_edit_toward_target(current, target, sigma_small=1, rng=random.Random(0))
+
+        self.assertIsNotNone(edit)
+        assert edit is not None
+        assert_edit_is_legal(self, current, edit, sigma_small=1)
+        assert_edit_reduces_distance(self, current, target, edit)
+        self.assertEqual(edit.selected_node_id, 0)
+        self.assertEqual(edit.mutation_kind, SAMPLED_SMALL_SUBTREE_REPLACEMENT)
+        self.assertEqual(edit.replacement_subtree, target)
+        self.assertEqual(edit.resulting_tree, target)
+
+    def test_oversized_target_uses_direct_small_subtree_when_target_subtree_fits(self) -> None:
         current = canonical_expr("pow x INT+ 5")
         target = canonical_expr("pow x add x pow x INT+ 2")
 
@@ -117,11 +132,10 @@ class EditPathTests(unittest.TestCase):
         assert edit is not None
         assert_edit_is_legal(self, current, edit, sigma_small=2)
         assert_edit_reduces_distance(self, current, target, edit)
-        self.assertEqual(edit.selected_node_id, 0)
+        self.assertEqual(edit.selected_node_id, 2)
         self.assertEqual(edit.mutation_kind, SAMPLED_SMALL_SUBTREE_REPLACEMENT)
-        self.assertIsInstance(edit.replacement_subtree, BinaryOp)
-        self.assertEqual(serialize_prefix_string(edit.replacement_subtree), "pow x add x x")
-        self.assertNotEqual(edit.resulting_tree, target)
+        self.assertEqual(serialize_prefix_string(edit.replacement_subtree), "add x pow x INT+ 2")
+        self.assertEqual(edit.resulting_tree, target)
 
     def test_compute_edit_path_reaches_target_on_simple_oversized_case(self) -> None:
         current = canonical_expr("pow x INT+ 5")
@@ -129,7 +143,7 @@ class EditPathTests(unittest.TestCase):
 
         path = compute_edit_path(current, target, sigma_small=2, rng=random.Random(0), max_steps=8)
 
-        self.assertGreaterEqual(len(path), 2)
+        self.assertEqual(len(path), 1)
         self.assertEqual(path[-1].resulting_tree, target)
 
         source = current
@@ -142,7 +156,7 @@ class EditPathTests(unittest.TestCase):
                 source = edit.resulting_tree
                 previous_distance = next_distance
 
-    def test_ancestor_direct_repair_handles_leaf_to_nonleaf_child_when_parent_is_legal(self) -> None:
+    def test_direct_child_repair_handles_leaf_to_nonleaf_child(self) -> None:
         current = canonical_expr("add x x")
         target = canonical_expr("add x pow x INT+ 2")
 
@@ -153,8 +167,9 @@ class EditPathTests(unittest.TestCase):
         assert_edit_is_legal(self, current, edit, sigma_small=2)
         assert_edit_reduces_distance(self, current, target, edit)
         self.assertEqual(edit.resulting_tree, target)
+        self.assertEqual(edit.selected_node_id, 2)
         self.assertEqual(edit.mutation_kind, SAMPLED_SMALL_SUBTREE_REPLACEMENT)
-        self.assertIsInstance(edit.original_subtree, BinaryOp)
+        self.assertEqual(serialize_prefix_string(edit.replacement_subtree), "pow x INT+ 2")
 
     def test_public_small_helpers_follow_operator_node_budget(self) -> None:
         self.assertTrue(is_small_enough(parse_prefix_string("x"), 0))

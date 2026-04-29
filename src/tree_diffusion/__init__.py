@@ -1,5 +1,13 @@
 """Tree diffusion infrastructure for symbolic integration."""
 
+from src.tree_diffusion.dataset import (
+    IntegrationPair,
+    TreeDiffusionBatchCollator,
+    TreeDiffusionIterableDataset,
+    load_integration_pairs_from_parquet,
+    make_tree_diffusion_dataloader,
+    pairs_from_prefix_rows,
+)
 from src.tree_diffusion.edit_path import (
     EditTarget,
     FirstMismatch,
@@ -16,6 +24,7 @@ from src.tree_diffusion.mutation import (
     collect_candidate_nodes,
     local_replace_once,
     mutate_once,
+    sample_random_expr,
     sample_valid_subtree,
 )
 from src.tree_diffusion.observation import (
@@ -28,3 +37,9 @@ from src.tree_diffusion.observation import (
     compute_symbolic_residual,
 )
 from src.tree_diffusion.positions import NodePosition, PositionIndex, index_tree_positions
+from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer, numeric_bucket_token
+from src.tree_diffusion.training_examples import (
+    TreeDiffusionTrainingExample,
+    generate_current_candidate,
+    generate_training_example,
+)
