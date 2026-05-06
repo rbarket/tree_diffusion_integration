@@ -12,7 +12,18 @@ from src.mathlang.conversions import ast_to_sympy, sympy_to_ast
 from src.mathlang.serializer import serialize_prefix_tokens
 
 
-DEFAULT_PROBE_POINTS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 3.0, 5.0)
+DEFAULT_PROBE_POINTS: tuple[float, ...] = (
+    -3.0,
+    -2.0,
+    -1.0,
+    -0.5,
+    -0.25,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+)
 RESIDUAL_MODES = frozenset({"none", "symbolic", "numeric", "both"})
 _NO_STRIP_VARIABLE = "__observation_no_strip__"
 _DEFAULT_COMPLEX_TOLERANCE = 1e-10

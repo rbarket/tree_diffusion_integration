@@ -1,0 +1,38 @@
+{
+  "data": {
+    "parquet": "data/processed/train_prefix_filtered.parquet",
+    "num_pairs": 32
+  },
+  "dataset": {
+    "batch_size": 8,
+    "max_input_length": 512,
+    "max_target_length": 128,
+    "sigma_small": 2,
+    "smax": 3,
+    "rho": 0.2,
+    "residual_mode": "both",
+    "num_workers": 0,
+    "shuffle_pairs": false
+  },
+  "model": {
+    "d_model": 64,
+    "n_heads": 4,
+    "d_ff": 128,
+    "n_encoder_layers": 1,
+    "n_decoder_layers": 1,
+    "dropout": 0.0
+  },
+  "training": {
+    "lr": 0.003,
+    "grad_clip_norm": 1.0
+  },
+  "runtime": {
+    "device": "cpu",
+    "seed": 123
+  },
+  "audit": {
+    "steps": 30,
+    "num_prediction_examples": 4,
+    "require_loss_decrease_after_steps": 5
+  }
+}

@@ -22,7 +22,18 @@ from src.tree_diffusion.observation import (
 )
 
 
-EXPECTED_DEFAULT_PROBE_POINTS = (0.25, 0.5, 1.0, 2.0, 3.0, 5.0)
+EXPECTED_DEFAULT_PROBE_POINTS = (
+    -3.0,
+    -2.0,
+    -1.0,
+    -0.5,
+    -0.25,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+)
 
 
 class ObservationTests(unittest.TestCase):
@@ -67,9 +78,10 @@ class ObservationTests(unittest.TestCase):
         self.assertNotIn("gold_target_antiderivative", field_names)
         self.assertNotIn("target_antiderivative", field_names)
 
-    def test_default_probe_points_are_positive_nonzero_and_deterministic(self) -> None:
+    def test_default_probe_points_are_mixed_signed_nonzero_and_deterministic(self) -> None:
         self.assertEqual(DEFAULT_PROBE_POINTS, EXPECTED_DEFAULT_PROBE_POINTS)
-        self.assertTrue(all(point > 0.0 for point in DEFAULT_PROBE_POINTS))
+        self.assertTrue(any(point < 0.0 for point in DEFAULT_PROBE_POINTS))
+        self.assertTrue(any(point > 0.0 for point in DEFAULT_PROBE_POINTS))
         self.assertTrue(all(point != 0.0 for point in DEFAULT_PROBE_POINTS))
 
     def test_compute_current_derivative_examples(self) -> None:

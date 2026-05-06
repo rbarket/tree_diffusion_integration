@@ -27,6 +27,13 @@ from src.tree_diffusion.mutation import (
     sample_random_expr,
     sample_valid_subtree,
 )
+from src.tree_diffusion.model import (
+    LearnedPositionalEmbedding,
+    TreeDiffusionModelConfig,
+    TreeDiffusionModelOutput,
+    TreeDiffusionPolicyModel,
+    build_tree_diffusion_policy_model,
+)
 from src.tree_diffusion.observation import (
     DEFAULT_PROBE_POINTS,
     NumericProbeFeatures,
@@ -38,8 +45,21 @@ from src.tree_diffusion.observation import (
 )
 from src.tree_diffusion.positions import NodePosition, PositionIndex, index_tree_positions
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer, numeric_bucket_token
+from src.tree_diffusion.train_step import (
+    TrainStepOutput,
+    compute_gradient_norm,
+    inspect_batch_predictions,
+    overfit_fixed_batch,
+    tree_diffusion_eval_step,
+    tree_diffusion_train_step,
+    validate_tree_diffusion_batch,
+)
 from src.tree_diffusion.training_examples import (
     TreeDiffusionTrainingExample,
     generate_current_candidate,
     generate_training_example,
+)
+from src.tree_diffusion.validation import (
+    OneStepEditDiagnosticSummary,
+    run_one_step_edit_diagnostics,
 )

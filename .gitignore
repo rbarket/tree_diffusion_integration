@@ -7,6 +7,10 @@
 !/config/**
 !/src/
 !/src/**
+!/tree_diffusion/
+!/tree_diffusion/**
+!/training/
+!/training/**
 !/tests/
 !/tests/**
 !/notebooks/

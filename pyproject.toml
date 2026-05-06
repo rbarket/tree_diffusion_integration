@@ -18,5 +18,5 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["src*", "tree_diffusion*", "training*"]
 namespaces = true
