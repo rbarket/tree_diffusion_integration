@@ -4,7 +4,7 @@ import random
 import unittest
 from fractions import Fraction
 
-from src.mathlang.ast import BinaryOp, Const, Var
+from src.mathlang.ast import Const, Var
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.edit_path import (

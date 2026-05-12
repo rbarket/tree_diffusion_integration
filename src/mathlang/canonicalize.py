@@ -6,8 +6,15 @@ from src.mathlang.ast import BinaryOp, Const, Expr, UnaryOp, Var
 from src.mathlang.grammar import is_commutative, normalize_token
 
 
-def canonicalize(expr: Expr, *, variable: str = "x") -> Expr:
+def canonicalize(
+    expr: Expr,
+    *,
+    variable: str = "x",
+    strip_additive_constants: bool = True,
+) -> Expr:
     normalized = _canonicalize_node(expr)
+    if not strip_additive_constants:
+        return normalized
     return _strip_top_level_constants(normalized, variable=variable)
 
 

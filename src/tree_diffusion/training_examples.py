@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from typing import Collection
 
 from src.mathlang.ast import Expr
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.edit_path import EditTarget, first_edit_toward_target, structural_distance
+from src.tree_diffusion.label_validation import validate_edit_label_progress
 from src.tree_diffusion.mutation import mutate_once, sample_random_expr
 from src.tree_diffusion.observation import Observation, build_observation
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
@@ -38,12 +40,16 @@ def generate_current_candidate(
     rho: float = 0.2,
     max_random_size: int | None = None,
     max_attempts: int = 32,
+    allow_complex_constants: bool = False,
+    allow_distributional_unary_ops: bool = False,
+    excluded_random_tokens: Collection[str] | None = None,
 ) -> tuple[Expr, int, bool]:
     _validate_generation_args(
         sigma_small=sigma_small,
         smax=smax,
         rho=rho,
         max_attempts=max_attempts,
+        observation_timeout_seconds=None,
     )
     if max_random_size is not None and max_random_size < 0:
         raise ValueError("max_random_size must be non-negative.")
@@ -55,7 +61,13 @@ def generate_current_candidate(
     for _ in range(max_attempts):
         use_random_init = _sample_random_init(rng, rho)
         if use_random_init:
-            current = sample_random_expr(rng=rng, max_size=random_size)
+            current = sample_random_expr(
+                rng=rng,
+                max_size=random_size,
+                allow_complex_constants=allow_complex_constants,
+                allow_distributional_unary_ops=allow_distributional_unary_ops,
+                excluded_random_tokens=excluded_random_tokens,
+            )
             if canonicalize(current) != target:
                 return current, 0, True
             continue
@@ -64,7 +76,14 @@ def generate_current_candidate(
         current = target
         successful_mutations = 0
         for _ in range(requested_mutations):
-            mutation = mutate_once(current, sigma_small=sigma_small, rng=rng)
+            mutation = mutate_once(
+                current,
+                sigma_small=sigma_small,
+                rng=rng,
+                allow_complex_constants=allow_complex_constants,
+                allow_distributional_unary_ops=allow_distributional_unary_ops,
+                excluded_random_tokens=excluded_random_tokens,
+            )
             if mutation is None:
                 break
             current = mutation.mutated_expr
@@ -97,17 +116,28 @@ def generate_training_example(
     max_target_length: int | None = None,
     max_random_size: int | None = None,
     max_attempts: int = 32,
+    observation_timeout_seconds: float | None = None,
+    simplify_symbolic_residual: bool = True,
+    allow_complex_constants: bool = False,
+    allow_distributional_unary_ops: bool = False,
+    excluded_random_tokens: Collection[str] | None = None,
+    validate_label: bool = False,
+    max_derivative_tokens: int | None = None,
+    max_residual_tokens: int | None = None,
 ) -> TreeDiffusionTrainingExample:
     _validate_generation_args(
         sigma_small=sigma_small,
         smax=smax,
         rho=rho,
         max_attempts=max_attempts,
+        observation_timeout_seconds=observation_timeout_seconds,
+        max_derivative_tokens=max_derivative_tokens,
+        max_residual_tokens=max_residual_tokens,
     )
 
     rng = rng or random.Random()
     tokenizer = tokenizer or TreeDiffusionTokenizer()
-    canonical_target_integrand = canonicalize(target_integrand)
+    canonical_target_integrand = canonicalize(target_integrand, strip_additive_constants=False)
     canonical_target_antiderivative = canonicalize(target_antiderivative)
     last_failure: str | None = None
 
@@ -120,6 +150,9 @@ def generate_training_example(
             rho=rho,
             max_random_size=max_random_size,
             max_attempts=max_attempts,
+            allow_complex_constants=allow_complex_constants,
+            allow_distributional_unary_ops=allow_distributional_unary_ops,
+            excluded_random_tokens=excluded_random_tokens,
         )
 
         edit_target = first_edit_toward_target(
@@ -144,11 +177,24 @@ def generate_training_example(
             )
             continue
 
+        if validate_label:
+            validation = validate_edit_label_progress(
+                current_antiderivative,
+                canonical_target_antiderivative,
+                edit_target,
+            )
+            if not validation.ok:
+                last_failure = f"edit_label_validation_failed:{validation.error or 'unknown'}"
+                continue
+
         observation = build_observation(
             canonical_target_integrand,
             current_antiderivative,
             residual_mode=residual_mode,
-            simplify_symbolic_residual=False,
+            simplify_symbolic_residual=simplify_symbolic_residual,
+            max_derivative_tokens=max_derivative_tokens,
+            max_residual_tokens=max_residual_tokens,
+            observation_timeout_seconds=observation_timeout_seconds,
         )
         input_tokens, target_tokens = tokenizer.serialize_training_pair(observation, edit_target)
 
@@ -203,6 +249,9 @@ def _validate_generation_args(
     smax: int,
     rho: float,
     max_attempts: int,
+    observation_timeout_seconds: float | None = None,
+    max_derivative_tokens: int | None = None,
+    max_residual_tokens: int | None = None,
 ) -> None:
     if sigma_small < 1:
         raise ValueError("sigma_small must be >= 1.")
@@ -212,6 +261,12 @@ def _validate_generation_args(
         raise ValueError("rho must satisfy 0.0 <= rho <= 1.0.")
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1.")
+    if observation_timeout_seconds is not None and observation_timeout_seconds <= 0.0:
+        raise ValueError("observation_timeout_seconds must be > 0 when provided.")
+    if max_derivative_tokens is not None and max_derivative_tokens < 1:
+        raise ValueError("max_derivative_tokens must be >= 1 when provided.")
+    if max_residual_tokens is not None and max_residual_tokens < 1:
+        raise ValueError("max_residual_tokens must be >= 1 when provided.")
 
 
 def _sample_random_init(rng: random.Random, rho: float) -> bool:

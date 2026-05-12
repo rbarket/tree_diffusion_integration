@@ -4,9 +4,7 @@ import unittest
 
 import torch
 
-from src.mathlang.parser import parse_prefix_string
-from src.tree_diffusion.dataset import IntegrationPair, make_tree_diffusion_dataloader
-from src.tree_diffusion.model import TreeDiffusionModelConfig, TreeDiffusionPolicyModel
+from src.tree_diffusion.dataset import make_tree_diffusion_dataloader
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 from src.tree_diffusion.train_step import (
     compute_gradient_norm,
@@ -16,6 +14,7 @@ from src.tree_diffusion.train_step import (
     tree_diffusion_train_step,
     validate_tree_diffusion_batch,
 )
+from tests.tree_diffusion_test_utils import sample_integration_pairs, small_policy_model
 
 
 class TreeDiffusionTrainStepTests(unittest.TestCase):
@@ -176,26 +175,7 @@ class TreeDiffusionTrainStepTests(unittest.TestCase):
 
 
 def _pairs() -> list[IntegrationPair]:
-    return [
-        IntegrationPair(
-            target_integrand=parse_prefix_string("pow x INT+ 2"),
-            target_antiderivative=parse_prefix_string("div pow x INT+ 3 INT+ 3"),
-            source="unit",
-            index=0,
-        ),
-        IntegrationPair(
-            target_integrand=parse_prefix_string("cos x"),
-            target_antiderivative=parse_prefix_string("sin x"),
-            source="unit",
-            index=1,
-        ),
-        IntegrationPair(
-            target_integrand=parse_prefix_string("exp x"),
-            target_antiderivative=parse_prefix_string("exp x"),
-            source="unit",
-            index=2,
-        ),
-    ]
+    return sample_integration_pairs()
 
 
 def _real_batch(tokenizer: TreeDiffusionTokenizer) -> dict:
@@ -221,23 +201,8 @@ def _small_model(
     *,
     d_model: int = 64,
     d_ff: int = 128,
-) -> TreeDiffusionPolicyModel:
-    return TreeDiffusionPolicyModel(
-        TreeDiffusionModelConfig(
-            vocab_size=tokenizer.vocab_size,
-            pad_token_id=tokenizer.pad_id,
-            bos_token_id=tokenizer.bos_id,
-            eos_token_id=tokenizer.eos_id,
-            max_input_length=128,
-            max_target_length=32,
-            d_model=d_model,
-            n_heads=4,
-            d_ff=d_ff,
-            n_encoder_layers=1,
-            n_decoder_layers=1,
-            dropout=0.0,
-        )
-    )
+):
+    return small_policy_model(tokenizer, d_model=d_model, d_ff=d_ff)
 
 
 def _clone_batch(batch: dict) -> dict:

@@ -6,11 +6,13 @@ import unittest
 import torch
 
 from src.mathlang.parser import parse_prefix_string
+from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.dataset import (
     IntegrationPair,
     TreeDiffusionBatchCollator,
     TreeDiffusionIterableDataset,
     make_tree_diffusion_dataloader,
+    pairs_from_prefix_rows,
 )
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
@@ -27,6 +29,7 @@ class TreeDiffusionDatasetTests(unittest.TestCase):
             {"pairs": pairs, "max_input_length": 0},
             {"pairs": pairs, "max_target_length": 0},
             {"pairs": pairs, "max_attempts": 0},
+            {"pairs": pairs, "observation_timeout_seconds": 0.0},
         )
 
         for kwargs in invalid_dataset_kwargs:
@@ -163,6 +166,27 @@ class TreeDiffusionDatasetTests(unittest.TestCase):
 
         self.assertEqual([int(item["pair_index"]) for item in items], [0, 1, 2, 0, 1, 2])
 
+    def test_shuffle_false_with_workers_shards_ordered_pairs(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        loader = make_tree_diffusion_dataloader(
+            _pairs(),
+            tokenizer=tokenizer,
+            batch_size=1,
+            num_workers=2,
+            sigma_small=2,
+            smax=1,
+            rho=0.0,
+            residual_mode="none",
+            max_input_length=256,
+            max_target_length=64,
+            base_seed=123,
+            shuffle_pairs=False,
+        )
+
+        items = list(itertools.islice(iter(loader), 6))
+
+        self.assertEqual([int(batch["pair_index"].item()) for batch in items], [0, 1, 2, 0, 1, 2])
+
     def test_rho_behavior(self) -> None:
         mutation_items = list(itertools.islice(iter(_dataset(rho=0.0, max_random_size=4)), 10))
         random_items = list(itertools.islice(iter(_dataset(rho=1.0, max_random_size=4)), 10))
@@ -198,6 +222,22 @@ class TreeDiffusionDatasetTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Failed to generate a tree-diffusion dataset item"):
             next(iter(dataset))
+
+    def test_pair_canonicalization_preserves_integrand_constants_only(self) -> None:
+        pair = pairs_from_prefix_rows(
+            [
+                {
+                    "integrand_prefix": "add x INT+ 2",
+                    "integral_prefix": "add div pow x INT+ 2 INT+ 2 INT+ 9",
+                }
+            ]
+        )[0]
+
+        self.assertEqual(serialize_prefix_string(pair.target_integrand), "add INT+ 2 x")
+        self.assertEqual(
+            serialize_prefix_string(pair.target_antiderivative),
+            "div pow x INT+ 2 INT+ 2",
+        )
 
 
 def _pairs() -> list[IntegrationPair]:

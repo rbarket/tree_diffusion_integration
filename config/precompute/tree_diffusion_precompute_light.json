@@ -1,0 +1,9 @@
+{
+  "input_data": "data/processed/train_prefix_filtered.parquet",
+  "output_dir": "data/precomputed/tree_diffusion_light",
+  "train_limit": 1000,
+  "val_limit": 100,
+  "shard_size": 1000,
+  "max_input_length": 1024,
+  "overwrite": true
+}

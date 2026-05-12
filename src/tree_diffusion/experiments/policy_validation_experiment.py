@@ -2,35 +2,38 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import torch
-
+from src.tree_diffusion._common import (
+    diagnostic_metrics as _diagnostic_metrics,
+    json_safe as _json_safe,
+    parse_bool as _parse_bool,
+    resolve_device as _resolve_device,
+    write_json as _write_json,
+)
 from src.tree_diffusion.dataset import (
     IntegrationPair,
     load_integration_pairs_from_parquet,
-    make_tree_diffusion_dataloader,
 )
-from src.tree_diffusion.model import TreeDiffusionModelConfig, TreeDiffusionPolicyModel
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 from src.tree_diffusion.validation import (
-    OneStepEditDiagnosticSummary,
     run_one_step_edit_diagnostics,
 )
 from src.training.workflows.tree_diffusion import (
     TreeDiffusionTrainingConfig,
+    build_policy_model_for_config,
     evaluate_tree_diffusion_policy,
     load_checkpoint,
+    make_loader_for_training_config,
     split_pairs_for_training,
     train_tree_diffusion_policy,
 )
 
 
-DEFAULT_EXPERIMENT_CONFIG_PATH = "config/experiments/tree_diffusion_policy_tiny.json"
+DEFAULT_EXPERIMENT_CONFIG_PATH: str | None = None
 _ROOT_FIELDS = {"experiment_name", "training", "final_eval"}
 _FINAL_EVAL_FIELDS = {"val_batches", "diagnostic_batches", "checkpoint"}
 _COMPARISON_FIELDS = (
@@ -102,26 +105,70 @@ def run_policy_experiment(
     experiment = load_policy_experiment_config(config_path, overrides=overrides)
     config = experiment.training
     output_dir = Path(config.output_dir)
+    _log_experiment(
+        "policy_experiment_start "
+        f"name={experiment.experiment_name} config={config_path} output_dir={output_dir}"
+    )
+    _log_experiment(
+        "policy_experiment_training_config "
+        f"train_data={config.train_data} val_data={config.val_data} "
+        f"train_limit={config.train_limit} val_limit={config.val_limit} "
+        f"num_epochs={config.num_epochs} batch_size={config.batch_size} "
+        f"num_workers={config.num_workers} "
+        f"simplify_symbolic_residual={config.simplify_symbolic_residual} "
+        f"allow_complex_constants={config.allow_complex_constants} "
+        f"allow_distributional_unary_ops={config.allow_distributional_unary_ops} "
+        f"validate_generated_labels={config.validate_generated_labels} "
+        f"observation_timeout_seconds={config.observation_timeout_seconds} "
+        f"device={config.device}"
+    )
+    _log_experiment(
+        "policy_experiment_final_eval_config "
+        f"val_batches={experiment.final_eval.val_batches} "
+        f"diagnostic_batches={experiment.final_eval.diagnostic_batches} "
+        f"checkpoint={experiment.final_eval.checkpoint}"
+    )
 
     train_pairs, val_pairs, split_description = _load_experiment_pairs(config)
+    _log_experiment(
+        "policy_experiment_split "
+        f"train_pairs={len(train_pairs)} val_pairs={len(val_pairs)} "
+        f"held_out={split_description.get('held_out_by_pair')} "
+        f"mode={split_description.get('mode')}"
+    )
 
     training_summary = train_tree_diffusion_policy(config)
+    _log_experiment(
+        "policy_experiment_training_finished "
+        f"final_train_loss={training_summary.get('final_train_loss')} "
+        f"best_val_loss={training_summary.get('best_val_loss')}"
+    )
     checkpoint_path, checkpoint_kind = _select_final_eval_checkpoint(
         final_eval=experiment.final_eval,
         best_checkpoint=training_summary.get("best_checkpoint"),
         last_checkpoint=training_summary.get("last_checkpoint"),
     )
+    _log_experiment(
+        "policy_experiment_final_checkpoint "
+        f"kind={checkpoint_kind} path={checkpoint_path}"
+    )
 
     device = _resolve_device(config.device)
     tokenizer = TreeDiffusionTokenizer(max_positions=config.max_positions)
-    model = _build_model(config, tokenizer).to(device)
+    model = build_policy_model_for_config(config, tokenizer).to(device)
     load_checkpoint(checkpoint_path, model=model, optimizer=None, map_location=device)
 
-    val_loader = _make_validation_loader(
+    val_loader = make_loader_for_training_config(
         val_pairs,
         tokenizer=tokenizer,
         config=config,
-        device=device,
+        base_seed=config.seed + 10_000,
+        shuffle_pairs=False,
+        precomputed_split="val",
+    )
+    _log_experiment(
+        "policy_experiment_final_ce_eval_start "
+        f"num_batches={experiment.final_eval.val_batches}"
     )
     final_val_metrics = evaluate_tree_diffusion_policy(
         model,
@@ -130,12 +177,30 @@ def run_policy_experiment(
         device=device,
         num_batches=experiment.final_eval.val_batches,
     )
+    _log_experiment(
+        "policy_experiment_final_ce_eval "
+        f"loss={final_val_metrics['loss']:.4f} "
+        f"position_accuracy={final_val_metrics['position_accuracy']:.4f} "
+        f"token_accuracy={final_val_metrics['token_accuracy']:.4f}"
+    )
+    _log_experiment(
+        "policy_experiment_final_diagnostics_start "
+        f"num_batches={experiment.final_eval.diagnostic_batches}"
+    )
     final_diagnostics = run_one_step_edit_diagnostics(
         model,
         val_loader,
         tokenizer=tokenizer,
         device=device,
         num_batches=experiment.final_eval.diagnostic_batches,
+    )
+    _log_experiment(
+        "policy_experiment_final_diagnostics "
+        f"valid_pos={final_diagnostics.valid_position_rate:.4f} "
+        f"parseable={final_diagnostics.parseable_replacement_rate:.4f} "
+        f"applicable={final_diagnostics.applicable_edit_rate:.4f} "
+        f"struct_improve={final_diagnostics.structural_improvement_rate:.4f} "
+        f"exact={final_diagnostics.exact_target_rate:.4f}"
     )
 
     summary = _build_summary(
@@ -152,6 +217,7 @@ def run_policy_experiment(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "experiment_summary.json", summary)
+    _log_experiment(f"policy_experiment_summary_written path={output_dir / 'experiment_summary.json'}")
     print("experiment_summary")
     print(json.dumps(summary, indent=2, sort_keys=True))
     return summary
@@ -178,31 +244,88 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--train-data", default=None, help="Override training.train_data.")
     parser.add_argument("--val-data", default=None, help="Override training.val_data.")
     parser.add_argument("--output-dir", default=None, help="Override training.output_dir.")
-    parser.add_argument("--max-steps", type=int, default=None, help="Override training.max_steps.")
+    parser.add_argument("--num-epochs", type=int, default=None, help="Override training.num_epochs.")
     parser.add_argument("--batch-size", type=int, default=None, help="Override training.batch_size.")
     parser.add_argument("--device", default=None, help="Override training.device.")
     parser.add_argument("--seed", type=int, default=None, help="Override training.seed.")
     parser.add_argument("--train-limit", type=int, default=None, help="Override training.train_limit.")
     parser.add_argument("--val-limit", type=int, default=None, help="Override training.val_limit.")
     parser.add_argument("--residual-mode", default=None, help="Override training.residual_mode.")
+    parser.add_argument("--resume-from", default=None, help="Override training.resume_from.")
+    parser.add_argument("--num-workers", type=int, default=None, help="Override training.num_workers.")
+    parser.add_argument("--simplify-symbolic-residual", type=_parse_bool, default=None)
+    parser.add_argument("--allow-complex-constants", type=_parse_bool, default=None)
+    parser.add_argument("--allow-distributional-unary-ops", type=_parse_bool, default=None)
+    parser.add_argument("--excluded-random-tokens", nargs="*", default=None)
+    parser.add_argument("--validate-generated-labels", type=_parse_bool, default=None)
+    parser.add_argument("--max-derivative-tokens", type=int, default=None)
+    parser.add_argument("--max-residual-tokens", type=int, default=None)
+    parser.add_argument(
+        "--observation-timeout-seconds",
+        type=float,
+        default=None,
+        help="Override training.observation_timeout_seconds.",
+    )
+    parser.add_argument("--accelerator", default=None, help="Override training.accelerator.")
+    parser.add_argument("--devices", default=None, help="Override training.devices.")
+    parser.add_argument("--precision", default=None, help="Override training.precision.")
+    parser.add_argument("--log-every-n-steps", type=int, default=None)
+    parser.add_argument("--num-sanity-val-steps", type=int, default=None)
+    parser.add_argument("--enable-progress-bar", type=_parse_bool, default=None)
+    parser.add_argument("--deterministic", type=_parse_bool, default=None)
+    parser.add_argument("--enable-wandb", type=_parse_bool, default=None)
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--wandb-run-id", default=None)
+    parser.add_argument("--wandb-resume", default=None)
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-dir", default=None)
+    parser.add_argument("--wandb-mode", default=None)
     args = parser.parse_args(argv)
 
     if args.compare is not None:
         rows = compare_policy_experiment_summaries(args.compare)
         print(json.dumps(rows, indent=2, sort_keys=True))
         return 0
+    if args.config is None:
+        parser.error("--config is required unless --compare is used.")
 
     overrides = {
         "train_data": args.train_data,
         "val_data": args.val_data,
         "output_dir": args.output_dir,
-        "max_steps": args.max_steps,
+        "num_epochs": args.num_epochs,
         "batch_size": args.batch_size,
         "device": args.device,
         "seed": args.seed,
         "train_limit": args.train_limit,
         "val_limit": args.val_limit,
         "residual_mode": args.residual_mode,
+        "resume_from": args.resume_from,
+        "num_workers": args.num_workers,
+        "simplify_symbolic_residual": args.simplify_symbolic_residual,
+        "allow_complex_constants": args.allow_complex_constants,
+        "allow_distributional_unary_ops": args.allow_distributional_unary_ops,
+        "excluded_random_tokens": tuple(args.excluded_random_tokens) if args.excluded_random_tokens is not None else None,
+        "validate_generated_labels": args.validate_generated_labels,
+        "max_derivative_tokens": args.max_derivative_tokens,
+        "max_residual_tokens": args.max_residual_tokens,
+        "observation_timeout_seconds": args.observation_timeout_seconds,
+        "accelerator": args.accelerator,
+        "devices": _parse_devices_override(args.devices),
+        "precision": args.precision,
+        "log_every_n_steps": args.log_every_n_steps,
+        "num_sanity_val_steps": args.num_sanity_val_steps,
+        "enable_progress_bar": args.enable_progress_bar,
+        "deterministic": args.deterministic,
+        "enable_wandb": args.enable_wandb,
+        "wandb_project": args.wandb_project,
+        "wandb_run_name": args.wandb_run_name,
+        "wandb_run_id": args.wandb_run_id,
+        "wandb_resume": args.wandb_resume,
+        "wandb_entity": args.wandb_entity,
+        "wandb_dir": args.wandb_dir,
+        "wandb_mode": args.wandb_mode,
     }
     run_policy_experiment(args.config, overrides=overrides)
     return 0
@@ -252,6 +375,15 @@ def _final_eval_from_raw(raw: Mapping[str, Any]) -> FinalEvalConfig:
 
 def _training_field_names() -> set[str]:
     return {field.name for field in fields(TreeDiffusionTrainingConfig)}
+
+
+def _parse_devices_override(value: str | None) -> Any:
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
 
 
 def _load_experiment_pairs(
@@ -321,57 +453,6 @@ def _select_final_eval_checkpoint(
     raise FileNotFoundError("No usable checkpoint was produced for final evaluation.")
 
 
-def _build_model(
-    config: TreeDiffusionTrainingConfig,
-    tokenizer: TreeDiffusionTokenizer,
-) -> TreeDiffusionPolicyModel:
-    return TreeDiffusionPolicyModel(
-        TreeDiffusionModelConfig(
-            vocab_size=tokenizer.vocab_size,
-            pad_token_id=tokenizer.pad_id,
-            bos_token_id=tokenizer.bos_id,
-            eos_token_id=tokenizer.eos_id,
-            max_input_length=config.max_input_length,
-            max_target_length=config.max_target_length,
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            d_ff=config.d_ff,
-            n_encoder_layers=config.n_encoder_layers,
-            n_decoder_layers=config.n_decoder_layers,
-            dropout=config.dropout,
-            norm_first=config.norm_first,
-            tie_embeddings=config.tie_embeddings,
-        )
-    )
-
-
-def _make_validation_loader(
-    val_pairs: Sequence[IntegrationPair],
-    *,
-    tokenizer: TreeDiffusionTokenizer,
-    config: TreeDiffusionTrainingConfig,
-    device: torch.device,
-):
-    return make_tree_diffusion_dataloader(
-        val_pairs,
-        tokenizer=tokenizer,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers,
-        sigma_small=config.sigma_small,
-        smax=config.smax,
-        rho=config.rho,
-        residual_mode=config.residual_mode,
-        max_input_length=config.max_input_length,
-        max_target_length=config.max_target_length,
-        base_seed=config.seed + 10_000,
-        shuffle_pairs=False,
-        max_attempts=config.max_attempts,
-        max_random_size=config.max_random_size,
-        include_metadata=True,
-        pin_memory=device.type == "cuda",
-    )
-
-
 def _build_summary(
     *,
     experiment: PolicyExperimentConfig,
@@ -382,7 +463,7 @@ def _build_summary(
     checkpoint_path: str,
     checkpoint_kind: str,
     final_val_metrics: Mapping[str, float],
-    final_diagnostics: OneStepEditDiagnosticSummary,
+    final_diagnostics: Any,
     wall_clock_seconds: float,
 ) -> dict[str, Any]:
     config = experiment.training
@@ -396,11 +477,17 @@ def _build_summary(
         "train_pairs_count": len(train_pairs),
         "val_pairs_count": len(val_pairs),
         "seed": config.seed,
-        "max_steps": config.max_steps,
+        "num_epochs": config.num_epochs,
+        "total_training_steps": training_summary.get("total_training_steps"),
         "residual_mode": config.residual_mode,
+        "simplify_symbolic_residual": config.simplify_symbolic_residual,
         "sigma_small": config.sigma_small,
         "smax": config.smax,
         "rho": config.rho,
+        "allow_complex_constants": config.allow_complex_constants,
+        "allow_distributional_unary_ops": config.allow_distributional_unary_ops,
+        "excluded_random_tokens": list(config.excluded_random_tokens),
+        "validate_generated_labels": config.validate_generated_labels,
         "d_model": config.d_model,
         "n_heads": config.n_heads,
         "d_ff": config.d_ff,
@@ -410,6 +497,10 @@ def _build_summary(
         "max_input_length": config.max_input_length,
         "max_target_length": config.max_target_length,
         "max_positions": config.max_positions,
+        "num_workers": config.num_workers,
+        "observation_timeout_seconds": config.observation_timeout_seconds,
+        "max_derivative_tokens": config.max_derivative_tokens,
+        "max_residual_tokens": config.max_residual_tokens,
         "best_checkpoint": training_summary.get("best_checkpoint"),
         "last_checkpoint": training_summary.get("last_checkpoint"),
         "final_eval_checkpoint": checkpoint_path,
@@ -441,48 +532,8 @@ def _build_summary(
     return _json_safe(summary)
 
 
-def _diagnostic_metrics(summary: OneStepEditDiagnosticSummary) -> dict[str, float | int | None]:
-    return {
-        "examples": summary.examples,
-        "valid_position_rate": summary.valid_position_rate,
-        "parseable_replacement_rate": summary.parseable_replacement_rate,
-        "applicable_edit_rate": summary.applicable_edit_rate,
-        "structural_improvement_rate": summary.structural_improvement_rate,
-        "numeric_residual_improvement_rate": summary.numeric_residual_improvement_rate,
-        "exact_target_rate": summary.exact_target_rate,
-        "mean_structural_distance_before": summary.mean_structural_distance_before,
-        "mean_structural_distance_after": summary.mean_structural_distance_after,
-    }
-
-
-def _resolve_device(device: str) -> torch.device:
-    if device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    resolved = torch.device(device)
-    if resolved.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA device requested but CUDA is not available.")
-    return resolved
-
-
-def _write_json(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(_json_safe(value), handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, torch.Tensor):
-        return _json_safe(value.detach().cpu().tolist())
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
+def _log_experiment(message: str) -> None:
+    print(message, flush=True)
 
 
 __all__ = [

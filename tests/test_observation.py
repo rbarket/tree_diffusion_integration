@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 import math
+import time
 import unittest
 from unittest.mock import patch
 
@@ -192,6 +193,34 @@ class ObservationTests(unittest.TestCase):
                 parse_prefix_string("pow x INT+ 2"),
                 parse_prefix_string("div pow x INT+ 3 INT+ 3"),
                 residual_mode="invalid",
+            )
+
+    def test_build_observation_times_out_slow_numeric_probe(self) -> None:
+        target = parse_prefix_string("pow x INT+ 2")
+        current = parse_prefix_string("div pow x INT+ 3 INT+ 3")
+
+        def slow_probe(*args, **kwargs):
+            del args, kwargs
+            time.sleep(1.0)
+
+        with patch("src.tree_diffusion.observation._compute_numeric_probes_from_sympy", slow_probe):
+            observation = build_observation(
+                target,
+                current,
+                residual_mode="numeric",
+                observation_timeout_seconds=0.01,
+            )
+
+        self.assertEqual(observation.status, "partial")
+        self.assertIsNone(observation.numeric_probes)
+        self.assertIn("numeric_probe_timeout", observation.warnings)
+
+    def test_invalid_observation_timeout_raises_clear_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "observation_timeout_seconds"):
+            build_observation(
+                parse_prefix_string("pow x INT+ 2"),
+                parse_prefix_string("div pow x INT+ 3 INT+ 3"),
+                observation_timeout_seconds=0.0,
             )
 
     def test_numeric_probes_zero_residual(self) -> None:

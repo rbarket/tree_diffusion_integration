@@ -8,14 +8,12 @@ from tempfile import TemporaryDirectory
 import pandas as pd
 import torch
 
-from src.mathlang.parser import parse_prefix_string
 from src.tree_diffusion.audit_training_pipeline import main as audit_main
 from src.tree_diffusion.dataset import (
     IntegrationPair,
     load_integration_pairs_from_parquet,
     make_tree_diffusion_dataloader,
 )
-from src.tree_diffusion.model import TreeDiffusionModelConfig, TreeDiffusionPolicyModel
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 from src.tree_diffusion.train_step import (
     inspect_batch_predictions,
@@ -23,6 +21,7 @@ from src.tree_diffusion.train_step import (
     tree_diffusion_train_step,
     validate_tree_diffusion_batch,
 )
+from tests.tree_diffusion_test_utils import sample_integration_pairs, small_policy_model
 
 
 DATASET_PATH = Path(__file__).resolve().parents[1] / "data" / "processed" / "train_prefix_filtered.parquet"
@@ -126,26 +125,7 @@ class TreeDiffusionTrainingPipelineE2ETests(unittest.TestCase):
 
 
 def _pairs() -> list[IntegrationPair]:
-    return [
-        IntegrationPair(
-            target_integrand=parse_prefix_string("pow x INT+ 2"),
-            target_antiderivative=parse_prefix_string("div pow x INT+ 3 INT+ 3"),
-            source="unit",
-            index=0,
-        ),
-        IntegrationPair(
-            target_integrand=parse_prefix_string("cos x"),
-            target_antiderivative=parse_prefix_string("sin x"),
-            source="unit",
-            index=1,
-        ),
-        IntegrationPair(
-            target_integrand=parse_prefix_string("exp x"),
-            target_antiderivative=parse_prefix_string("exp x"),
-            source="unit",
-            index=2,
-        ),
-    ]
+    return sample_integration_pairs()
 
 
 def _batch(
@@ -164,6 +144,7 @@ def _batch(
         rho=0.2,
         max_input_length=128,
         max_target_length=32,
+        simplify_symbolic_residual=False,
         base_seed=123,
         shuffle_pairs=False,
         include_metadata=True,
@@ -171,23 +152,8 @@ def _batch(
     return next(iter(loader))
 
 
-def _small_model(tokenizer: TreeDiffusionTokenizer) -> TreeDiffusionPolicyModel:
-    return TreeDiffusionPolicyModel(
-        TreeDiffusionModelConfig(
-            vocab_size=tokenizer.vocab_size,
-            pad_token_id=tokenizer.pad_id,
-            bos_token_id=tokenizer.bos_id,
-            eos_token_id=tokenizer.eos_id,
-            max_input_length=128,
-            max_target_length=32,
-            d_model=32,
-            n_heads=4,
-            d_ff=64,
-            n_encoder_layers=1,
-            n_decoder_layers=1,
-            dropout=0.0,
-        )
-    )
+def _small_model(tokenizer: TreeDiffusionTokenizer):
+    return small_policy_model(tokenizer)
 
 
 if __name__ == "__main__":

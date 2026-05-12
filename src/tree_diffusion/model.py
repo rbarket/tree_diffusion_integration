@@ -16,7 +16,7 @@ class TreeDiffusionModelConfig:
     bos_token_id: int
     eos_token_id: int
 
-    max_input_length: int = 512
+    max_input_length: int = 1024
     max_target_length: int = 128
 
     d_model: int = 256
@@ -386,7 +386,7 @@ class TreeDiffusionPolicyModel(nn.Module):
 def build_tree_diffusion_policy_model(
     tokenizer: TreeDiffusionTokenizer,
     *,
-    max_input_length: int = 512,
+    max_input_length: int = 1024,
     max_target_length: int = 128,
     d_model: int = 256,
     n_heads: int = 8,

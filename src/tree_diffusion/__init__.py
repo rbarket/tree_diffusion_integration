@@ -19,9 +19,15 @@ from src.tree_diffusion.edit_path import (
     subtree_size,
     trees_equal,
 )
+from src.tree_diffusion.label_validation import (
+    EditLabelValidationResult,
+    apply_subtree_replacement_by_position,
+    validate_edit_label_progress,
+)
 from src.tree_diffusion.mutation import (
     MutationResult,
     collect_candidate_nodes,
+    is_obviously_zero,
     local_replace_once,
     mutate_once,
     sample_random_expr,
@@ -42,6 +48,19 @@ from src.tree_diffusion.observation import (
     compute_current_derivative,
     compute_numeric_probes,
     compute_symbolic_residual,
+)
+from src.tree_diffusion.precompute_dataset import (
+    PrecomputedTreeDiffusionExampleRecord,
+    TreeDiffusionPrecomputeConfig,
+    load_precompute_config,
+    precompute_split,
+    precompute_tree_diffusion_dataset,
+    precomputed_record_from_training_example,
+    split_pairs_for_precompute,
+)
+from src.tree_diffusion.precomputed_dataset import (
+    PrecomputedTreeDiffusionDataset,
+    load_precomputed_tokenizer_metadata,
 )
 from src.tree_diffusion.positions import NodePosition, PositionIndex, index_tree_positions
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer, numeric_bucket_token

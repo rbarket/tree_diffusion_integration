@@ -15,15 +15,40 @@
 !/tests/**
 !/notebooks/
 !/notebooks/mutation_walkthrough.ipynb
+/notebooks/mutation_walkthrough_presentation.ipynb
 
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 .ipynb_checkpoints/
+.DS_Store
 
 /.venv/
 *.egg-info/
+
+# Generated datasets, precomputed shards, audits, training runs, and model artifacts.
 /data/
+/data/**
 /artifacts/
+/artifacts/**
+/runs/
+/runs/**
+/outputs/
+/outputs/**
+/checkpoints/
+/checkpoints/**
+/wandb/
+/wandb/**
+/mlruns/
+/mlruns/**
+*.parquet
+*.jsonl
+*.log
+*.pt
+*.pth
+*.ckpt
+*.safetensors

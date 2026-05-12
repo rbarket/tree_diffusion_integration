@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 import unittest
 
-from src.mathlang.ast import BinaryOp, UnaryOp, Var
+from src.mathlang.ast import BinaryOp, Var
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string

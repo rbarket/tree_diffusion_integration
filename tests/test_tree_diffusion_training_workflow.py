@@ -5,13 +5,17 @@ import math
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest import mock
 
-import pandas as pd
 import torch
 
 from src.tree_diffusion.dataset import load_integration_pairs_from_parquet, make_tree_diffusion_dataloader
-from src.tree_diffusion.model import TreeDiffusionModelConfig, TreeDiffusionPolicyModel
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
+from src.training.lightning.tree_diffusion_wandb import (
+    GLOBAL_STEP_METRIC,
+    build_tree_diffusion_wandb_tracker,
+)
 from src.training.workflows.tree_diffusion import (
     TreeDiffusionTrainingConfig,
     evaluate_tree_diffusion_policy,
@@ -20,6 +24,11 @@ from src.training.workflows.tree_diffusion import (
     main,
     save_checkpoint,
     train_tree_diffusion_policy,
+)
+from tests.tree_diffusion_test_utils import (
+    small_policy_model,
+    tiny_training_config_values,
+    write_toy_parquet,
 )
 
 
@@ -47,9 +56,9 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
                 load_training_config(work_dir / "invalid_fraction.json")
 
             invalid_steps = _config_dict(parquet)
-            invalid_steps["max_steps"] = 0
+            invalid_steps["num_epochs"] = 0
             (work_dir / "invalid_steps.json").write_text(json.dumps(invalid_steps), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "max_steps"):
+            with self.assertRaisesRegex(ValueError, "num_epochs"):
                 load_training_config(work_dir / "invalid_steps.json")
 
             unknown = _config_dict(parquet)
@@ -70,6 +79,7 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
             self.assertTrue(Path(summary["output_dir"]).exists())
             self.assertTrue((Path(summary["output_dir"]) / "metrics.jsonl").exists())
             self.assertTrue((Path(summary["output_dir"]) / "checkpoint_last.pt").exists())
+            self.assertTrue((Path(summary["output_dir"]) / "lightning" / "last.ckpt").exists())
             rows = _read_metrics(Path(summary["output_dir"]) / "metrics.jsonl")
             self.assertTrue(any(row["split"] == "train" for row in rows))
             self.assertTrue(any(row["split"] == "val" for row in rows))
@@ -116,21 +126,44 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
             work_dir = Path(temp_dir)
             parquet = _write_parquet(work_dir / "toy.parquet")
             output_dir = work_dir / "run"
-            first = TreeDiffusionTrainingConfig(**_config_dict(parquet, output_dir=output_dir, max_steps=2))
+            first = TreeDiffusionTrainingConfig(**_config_dict(parquet, output_dir=output_dir, num_epochs=1))
             train_tree_diffusion_policy(first)
             checkpoint = output_dir / "checkpoint_last.pt"
+            legacy_checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            self.assertIn("lightning_resume_ckpt", legacy_checkpoint)
+            self.assertTrue(Path(legacy_checkpoint["lightning_resume_ckpt"]).exists())
 
             resumed_values = _config_dict(
                 parquet,
                 output_dir=output_dir,
-                max_steps=3,
+                num_epochs=2,
             )
             resumed_values["resume_from"] = str(checkpoint)
             summary = train_tree_diffusion_policy(TreeDiffusionTrainingConfig(**resumed_values))
 
-            self.assertEqual(summary["final_step"], 3)
+            self.assertEqual(summary["final_step"], 4)
             rows = _read_metrics(output_dir / "metrics.jsonl")
-            self.assertTrue(any(row["split"] == "train" and row["step"] == 3 for row in rows))
+            self.assertTrue(any(row["split"] == "train" and row["step"] == 4 for row in rows))
+
+    def test_resume_training_from_lightning_checkpoint(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            parquet = _write_parquet(work_dir / "toy.parquet")
+            output_dir = work_dir / "run"
+            first = TreeDiffusionTrainingConfig(**_config_dict(parquet, output_dir=output_dir, num_epochs=1))
+            train_tree_diffusion_policy(first)
+            lightning_checkpoint = output_dir / "lightning" / "last.ckpt"
+
+            resumed_values = _config_dict(
+                parquet,
+                output_dir=output_dir,
+                num_epochs=2,
+            )
+            resumed_values["resume_from"] = str(lightning_checkpoint)
+            summary = train_tree_diffusion_policy(TreeDiffusionTrainingConfig(**resumed_values))
+
+            self.assertEqual(summary["final_step"], 4)
+            self.assertTrue((output_dir / "checkpoint_last.pt").exists())
 
     def test_evaluate_tree_diffusion_policy_returns_averages(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -180,7 +213,7 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
                 [
                     "--config",
                     str(config_path),
-                    "--max-steps",
+                    "--num-epochs",
                     "1",
                     "--batch-size",
                     "2",
@@ -208,10 +241,10 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
             run_b = work_dir / "run_b"
 
             train_tree_diffusion_policy(
-                TreeDiffusionTrainingConfig(**_config_dict(parquet, output_dir=run_a, max_steps=2))
+                TreeDiffusionTrainingConfig(**_config_dict(parquet, output_dir=run_a, num_epochs=1))
             )
             train_tree_diffusion_policy(
-                TreeDiffusionTrainingConfig(**_config_dict(parquet, output_dir=run_b, max_steps=2))
+                TreeDiffusionTrainingConfig(**_config_dict(parquet, output_dir=run_b, num_epochs=1))
             )
 
             first_train_a = _first_metric(run_a / "metrics.jsonl", "train")
@@ -221,67 +254,69 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
             self.assertAlmostEqual(first_train_a["loss"], first_train_b["loss"], places=6)
             self.assertAlmostEqual(first_val_a["loss"], first_val_b["loss"], places=6)
 
+    def test_wandb_tracker_disabled_is_noop(self) -> None:
+        cfg = _wandb_cfg(enable_wandb=False)
+        tracker = build_tree_diffusion_wandb_tracker(cfg, _model_cfg())
+
+        tracker.track_many({"train/loss": 1.0}, step=1)
+
+        self.assertIsNone(tracker.run)
+
+    def test_wandb_tracker_logs_prefixed_metrics_with_resume(self) -> None:
+        captured_kwargs = {}
+
+        class _FakeWandbSdk:
+            @staticmethod
+            def init(**kwargs):
+                captured_kwargs.update(kwargs)
+                return _FakeRun(run_id=str(kwargs.get("id")), run_name=str(kwargs.get("name")))
+
+        cfg = _wandb_cfg(enable_wandb=True)
+        with mock.patch(
+            "src.training.lightning.tree_diffusion_wandb._import_wandb_sdk",
+            return_value=_FakeWandbSdk(),
+        ):
+            tracker = build_tree_diffusion_wandb_tracker(
+                cfg,
+                _model_cfg(),
+                run_id="resume-123",
+                resume="allow",
+            )
+
+        tracker.track_many({"train/loss": 1.25, "train/lr": 0.003}, step=7)
+        tracker.track_prefixed_metrics({"loss": 0.9, "position_accuracy": 0.4}, prefix="val", step=8)
+        tracker.track_prefixed_metrics({"valid_position_rate": 0.5}, prefix="diagnostic", step=8)
+
+        self.assertEqual(captured_kwargs["id"], "resume-123")
+        self.assertEqual(captured_kwargs["resume"], "allow")
+        self.assertEqual(captured_kwargs["project"], "tree-tests")
+        self.assertIsNotNone(tracker.run)
+        assert tracker.run is not None
+        self.assertEqual(
+            tracker.run.logged[0],
+            {GLOBAL_STEP_METRIC: 7, "train/loss": 1.25, "train/lr": 0.003},
+        )
+        self.assertEqual(
+            tracker.run.logged[1],
+            {GLOBAL_STEP_METRIC: 8, "val/loss": 0.9, "val/position_accuracy": 0.4},
+        )
+        self.assertEqual(
+            tracker.run.logged[2],
+            {GLOBAL_STEP_METRIC: 8, "diagnostic/valid_position_rate": 0.5},
+        )
+
 
 def _write_parquet(path: Path) -> Path:
-    pd.DataFrame(
-        [
-            {"integrand_prefix": "pow x INT+ 2", "integral_prefix": "div pow x INT+ 3 INT+ 3"},
-            {"integrand_prefix": "cos x", "integral_prefix": "sin x"},
-            {"integrand_prefix": "exp x", "integral_prefix": "exp x"},
-            {"integrand_prefix": "INT+ 1", "integral_prefix": "x"},
-        ]
-    ).to_parquet(path)
-    return path
+    return write_toy_parquet(path)
 
 
 def _config_dict(
     parquet: Path,
     *,
     output_dir: Path | None = None,
-    max_steps: int = 2,
+    num_epochs: int = 1,
 ) -> dict:
-    return {
-        "train_data": str(parquet),
-        "val_data": None,
-        "output_dir": str(output_dir or parquet.parent / "run"),
-        "train_limit": 4,
-        "val_limit": 2,
-        "val_fraction": 0.25,
-        "seed": 123,
-        "device": "cpu",
-        "max_steps": max_steps,
-        "batch_size": 2,
-        "num_workers": 0,
-        "sigma_small": 2,
-        "smax": 3,
-        "rho": 0.2,
-        "residual_mode": "both",
-        "max_input_length": 128,
-        "max_target_length": 32,
-        "max_positions": 128,
-        "max_random_size": None,
-        "max_attempts": 32,
-        "d_model": 32,
-        "n_heads": 4,
-        "d_ff": 64,
-        "n_encoder_layers": 1,
-        "n_decoder_layers": 1,
-        "dropout": 0.0,
-        "norm_first": True,
-        "tie_embeddings": True,
-        "lr": 0.003,
-        "weight_decay": 0.01,
-        "betas": [0.9, 0.999],
-        "grad_clip_norm": 1.0,
-        "log_every": 1,
-        "val_every": 1,
-        "checkpoint_every": 2,
-        "val_batches": 1,
-        "diagnostic_batches": 1,
-        "resume_from": None,
-        "save_best": True,
-        "save_last": True,
-    }
+    return tiny_training_config_values(parquet, output_dir=output_dir, num_epochs=num_epochs)
 
 
 def _write_config(path: Path, parquet: Path, *, output_dir: Path | None = None) -> Path:
@@ -289,23 +324,8 @@ def _write_config(path: Path, parquet: Path, *, output_dir: Path | None = None) 
     return path
 
 
-def _small_model(tokenizer: TreeDiffusionTokenizer) -> TreeDiffusionPolicyModel:
-    return TreeDiffusionPolicyModel(
-        TreeDiffusionModelConfig(
-            vocab_size=tokenizer.vocab_size,
-            pad_token_id=tokenizer.pad_id,
-            bos_token_id=tokenizer.bos_id,
-            eos_token_id=tokenizer.eos_id,
-            max_input_length=128,
-            max_target_length=32,
-            d_model=32,
-            n_heads=4,
-            d_ff=64,
-            n_encoder_layers=1,
-            n_decoder_layers=1,
-            dropout=0.0,
-        )
-    )
+def _small_model(tokenizer: TreeDiffusionTokenizer):
+    return small_policy_model(tokenizer)
 
 
 def _read_metrics(path: Path) -> list[dict]:
@@ -317,6 +337,50 @@ def _first_metric(path: Path, split: str) -> dict:
         if row["split"] == split:
             return row
     raise AssertionError(f"No {split!r} metric row found.")
+
+
+class _FakeConfig(dict):
+    def update(self, values, allow_val_change=False):  # type: ignore[override]
+        self["_allow_val_change"] = bool(allow_val_change)
+        super().update(values)
+
+
+class _FakeRun:
+    def __init__(self, *, run_id: str, run_name: str) -> None:
+        self.id = run_id
+        self.name = run_name
+        self.logged: list[dict[str, float]] = []
+        self.defined_metrics: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.config = _FakeConfig()
+
+    def log(self, data):
+        self.logged.append(dict(data))
+
+    def define_metric(self, *args, **kwargs):
+        self.defined_metrics.append((args, dict(kwargs)))
+
+    def finish(self) -> None:
+        pass
+
+
+def _wandb_cfg(*, enable_wandb: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        enable_wandb=enable_wandb,
+        wandb_project="tree-tests",
+        wandb_run_name="tree-run",
+        wandb_run_id=None,
+        wandb_resume=None,
+        wandb_entity=None,
+        wandb_dir=None,
+        wandb_mode="offline",
+        batch_size=2,
+        num_epochs=2,
+        lr=0.003,
+    )
+
+
+def _model_cfg() -> SimpleNamespace:
+    return SimpleNamespace(d_model=32, n_heads=4, d_ff=64)
 
 
 if __name__ == "__main__":

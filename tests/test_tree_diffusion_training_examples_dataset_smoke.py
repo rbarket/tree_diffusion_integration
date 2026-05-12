@@ -64,6 +64,7 @@ class TreeDiffusionTrainingExamplesDatasetSmokeTests(unittest.TestCase):
                     smax=3,
                     rho=0.2,
                     residual_mode="both",
+                    simplify_symbolic_residual=False,
                     encode=True,
                     max_input_length=512,
                     max_target_length=128,

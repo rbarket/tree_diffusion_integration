@@ -3,11 +3,8 @@ from __future__ import annotations
 import json
 import math
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
-
-import pandas as pd
 
 from src.tree_diffusion.dataset import load_integration_pairs_from_parquet
 from src.tree_diffusion.experiments.policy_validation_experiment import (
@@ -16,6 +13,7 @@ from src.tree_diffusion.experiments.policy_validation_experiment import (
     run_policy_experiment,
 )
 from src.training.workflows.tree_diffusion import split_pairs_for_training
+from tests.tree_diffusion_test_utils import tiny_training_config_values, write_toy_parquet
 
 
 class TreeDiffusionPolicyExperimentTests(unittest.TestCase):
@@ -49,9 +47,9 @@ class TreeDiffusionPolicyExperimentTests(unittest.TestCase):
                 load_policy_experiment_config(work_dir / "training_unknown.json")
 
             bad_steps = _experiment_config_dict(parquet)
-            bad_steps["training"]["max_steps"] = 0
+            bad_steps["training"]["num_epochs"] = 0
             (work_dir / "bad_steps.json").write_text(json.dumps(bad_steps), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "max_steps"):
+            with self.assertRaisesRegex(ValueError, "num_epochs"):
                 load_policy_experiment_config(work_dir / "bad_steps.json")
 
             bad_batch = _experiment_config_dict(parquet)
@@ -59,6 +57,12 @@ class TreeDiffusionPolicyExperimentTests(unittest.TestCase):
             (work_dir / "bad_batch.json").write_text(json.dumps(bad_batch), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "batch_size"):
                 load_policy_experiment_config(work_dir / "bad_batch.json")
+
+            bad_timeout = _experiment_config_dict(parquet)
+            bad_timeout["training"]["observation_timeout_seconds"] = 0.0
+            (work_dir / "bad_timeout.json").write_text(json.dumps(bad_timeout), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "observation_timeout_seconds"):
+                load_policy_experiment_config(work_dir / "bad_timeout.json")
 
             bad_final_eval = _experiment_config_dict(parquet)
             bad_final_eval["final_eval"] = {"val_batches": 0}
@@ -154,24 +158,26 @@ class TreeDiffusionPolicyExperimentTests(unittest.TestCase):
             self.assertIn(summary["final_eval_checkpoint_kind"], {"best", "last_fallback"})
             self.assertTrue(Path(summary["final_eval_checkpoint"]).exists())
 
-    def test_residual_ablation_configs_are_valid_and_matched(self) -> None:
-        both = load_policy_experiment_config(
-            "config/experiments/tree_diffusion_policy_residual_ablation_both.json"
-        )
-        none = load_policy_experiment_config(
-            "config/experiments/tree_diffusion_policy_residual_ablation_none.json"
-        )
+    def test_resume_from_override_is_supported(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            parquet = _write_parquet(work_dir / "toy.parquet")
+            resume_path = work_dir / "checkpoint_last.pt"
+            resume_path.write_bytes(b"placeholder")
+            config_path = _write_experiment_config(work_dir / "config.json", parquet)
 
-        self.assertEqual(both.training.residual_mode, "both")
-        self.assertEqual(none.training.residual_mode, "none")
+            config = load_policy_experiment_config(
+                config_path,
+                overrides={
+                    "resume_from": str(resume_path),
+                    "num_workers": 3,
+                    "observation_timeout_seconds": 7.5,
+                },
+            )
 
-        both_training = asdict(both.training)
-        none_training = asdict(none.training)
-        for key in ("output_dir", "residual_mode"):
-            both_training.pop(key)
-            none_training.pop(key)
-        self.assertEqual(both_training, none_training)
-        self.assertEqual(both.final_eval, none.final_eval)
+            self.assertEqual(config.training.resume_from, str(resume_path))
+            self.assertEqual(config.training.num_workers, 3)
+            self.assertEqual(config.training.observation_timeout_seconds, 7.5)
 
     def test_compare_summaries_utility(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -198,16 +204,7 @@ class TreeDiffusionPolicyExperimentTests(unittest.TestCase):
 
 
 def _write_parquet(path: Path) -> Path:
-    pd.DataFrame(
-        [
-            {"integrand_prefix": "pow x INT+ 2", "integral_prefix": "div pow x INT+ 3 INT+ 3"},
-            {"integrand_prefix": "cos x", "integral_prefix": "sin x"},
-            {"integrand_prefix": "exp x", "integral_prefix": "exp x"},
-            {"integrand_prefix": "INT+ 1", "integral_prefix": "x"},
-            {"integrand_prefix": "INT+ 0", "integral_prefix": "INT+ 0"},
-        ]
-    ).to_parquet(path)
-    return path
+    return write_toy_parquet(path, include_zero_row=True)
 
 
 def _experiment_config_dict(
@@ -218,48 +215,7 @@ def _experiment_config_dict(
 ) -> dict:
     return {
         "experiment_name": "unit_policy_experiment",
-        "training": {
-            "train_data": str(parquet),
-            "val_data": None,
-            "output_dir": str(output_dir or parquet.parent / "run"),
-            "train_limit": 4,
-            "val_limit": 2,
-            "val_fraction": 0.25,
-            "seed": 123,
-            "device": "cpu",
-            "max_steps": 2,
-            "batch_size": 2,
-            "num_workers": 0,
-            "sigma_small": 2,
-            "smax": 3,
-            "rho": 0.2,
-            "residual_mode": "both",
-            "max_input_length": 128,
-            "max_target_length": 32,
-            "max_positions": 128,
-            "max_random_size": None,
-            "max_attempts": 32,
-            "d_model": 32,
-            "n_heads": 4,
-            "d_ff": 64,
-            "n_encoder_layers": 1,
-            "n_decoder_layers": 1,
-            "dropout": 0.0,
-            "norm_first": True,
-            "tie_embeddings": True,
-            "lr": 0.003,
-            "weight_decay": 0.01,
-            "betas": [0.9, 0.999],
-            "grad_clip_norm": 1.0,
-            "log_every": 1,
-            "val_every": 1,
-            "checkpoint_every": 2,
-            "val_batches": 1,
-            "diagnostic_batches": 1,
-            "resume_from": None,
-            "save_best": True,
-            "save_last": True,
-        },
+        "training": tiny_training_config_values(parquet, output_dir=output_dir),
         **({"final_eval": final_eval} if final_eval is not None else {}),
     }
 

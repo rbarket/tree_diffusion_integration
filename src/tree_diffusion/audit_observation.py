@@ -15,6 +15,7 @@ import pandas as pd
 from src.mathlang.ast import Expr
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string, serialize_prefix_tokens
+from src.tree_diffusion._common import mean_or_none
 from src.tree_diffusion.mutation import mutate_once
 from src.tree_diffusion.observation import Observation, build_observation
 
@@ -385,9 +386,8 @@ def _status_rate(
 
 
 def _mean_or_none(values: list[float]) -> float | None:
-    if not values:
-        return None
-    return round(float(statistics.mean(values)), 6)
+    value = mean_or_none(values)
+    return None if value is None else round(value, 6)
 
 
 def _timing_stats(values: list[float]) -> dict[str, float | int | None]:

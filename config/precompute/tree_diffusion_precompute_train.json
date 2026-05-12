@@ -1,0 +1,9 @@
+{
+  "input_data": "data/processed/train_prefix_filtered.parquet",
+  "output_dir": "data/precomputed/tree_diffusion_v1",
+  "train_limit": 1000000,
+  "val_limit": null,
+  "val_fraction": 0.0,
+  "max_input_length": 1024,
+  "num_workers": 32
+}

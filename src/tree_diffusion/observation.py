@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
+import signal
+import threading
 from typing import Sequence
 
 import sympy as sp
@@ -25,8 +28,11 @@ DEFAULT_PROBE_POINTS: tuple[float, ...] = (
     3.0,
 )
 RESIDUAL_MODES = frozenset({"none", "symbolic", "numeric", "both"})
-_NO_STRIP_VARIABLE = "__observation_no_strip__"
 _DEFAULT_COMPLEX_TOLERANCE = 1e-10
+
+
+class ObservationTimeoutError(TimeoutError):
+    """Raised when SymPy-backed observation construction exceeds its budget."""
 
 
 @dataclass(frozen=True)
@@ -120,8 +126,10 @@ def build_observation(
     simplify_symbolic_residual: bool = True,
     max_derivative_tokens: int | None = None,
     max_residual_tokens: int | None = None,
+    observation_timeout_seconds: float | None = None,
 ) -> Observation:
     _validate_residual_mode(residual_mode)
+    _validate_timeout(observation_timeout_seconds)
 
     warnings: list[str] = []
     canonical_target = _canonicalize_expr(target_integrand)
@@ -134,10 +142,23 @@ def build_observation(
     target_integrand_sym: sp.Expr | None = None
 
     try:
-        current_derivative_sym = _compute_current_derivative_sympy(
-            canonical_current,
-            var=var,
-            simplify_derivative=simplify_derivative,
+        with _observation_timeout(observation_timeout_seconds):
+            current_derivative_sym = _compute_current_derivative_sympy(
+                canonical_current,
+                var=var,
+                simplify_derivative=simplify_derivative,
+            )
+    except ObservationTimeoutError:
+        warnings.append("derivative_timeout")
+        return Observation(
+            target_integrand=canonical_target,
+            current_antiderivative=canonical_current,
+            current_derivative=None,
+            symbolic_residual=None,
+            numeric_probes=None,
+            residual_mode=residual_mode,
+            status="derivative_failed",
+            warnings=tuple(warnings),
         )
     except Exception as exc:
         warnings.append(f"derivative_failed:{type(exc).__name__}")
@@ -153,9 +174,13 @@ def build_observation(
         )
 
     try:
-        current_derivative = _canonicalize_expr(sympy_to_ast(current_derivative_sym))
+        with _observation_timeout(observation_timeout_seconds):
+            current_derivative = _canonicalize_expr(sympy_to_ast(current_derivative_sym))
     except Exception as exc:
-        warnings.append(f"derivative_ast_conversion_failed:{type(exc).__name__}")
+        if isinstance(exc, ObservationTimeoutError):
+            warnings.append("derivative_ast_conversion_timeout")
+        else:
+            warnings.append(f"derivative_ast_conversion_failed:{type(exc).__name__}")
     else:
         current_derivative = _apply_token_cap(
             current_derivative,
@@ -172,28 +197,32 @@ def build_observation(
 
     if residual_mode in {"symbolic", "both"} and target_integrand_sym is not None:
         try:
-            symbolic_residual_sym = _compute_symbolic_residual_sympy(
-                current_derivative_sym,
-                target_integrand_sym,
-                simplify_residual=simplify_symbolic_residual,
-            )
-            symbolic_residual = _canonicalize_expr(sympy_to_ast(symbolic_residual_sym))
-            symbolic_residual = _apply_token_cap(
-                symbolic_residual,
-                component_name="symbolic_residual",
-                max_tokens=max_residual_tokens,
-                warnings=warnings,
-            )
+            with _observation_timeout(observation_timeout_seconds):
+                symbolic_residual_sym = _compute_symbolic_residual_sympy(
+                    current_derivative_sym,
+                    target_integrand_sym,
+                    simplify_residual=simplify_symbolic_residual,
+                )
+                symbolic_residual = _canonicalize_expr(sympy_to_ast(symbolic_residual_sym))
+                symbolic_residual = _apply_token_cap(
+                    symbolic_residual,
+                    component_name="symbolic_residual",
+                    max_tokens=max_residual_tokens,
+                    warnings=warnings,
+                )
+        except ObservationTimeoutError:
+            warnings.append("symbolic_residual_timeout")
         except Exception as exc:
             warnings.append(f"symbolic_residual_failed:{type(exc).__name__}")
 
     if residual_mode in {"numeric", "both"} and target_integrand_sym is not None:
         try:
-            numeric_probes = _compute_numeric_probes_from_sympy(
-                current_derivative_sym - target_integrand_sym,
-                probe_points=probe_points,
-                var=var,
-            )
+            with _observation_timeout(observation_timeout_seconds):
+                numeric_probes = _compute_numeric_probes_from_sympy(
+                    current_derivative_sym - target_integrand_sym,
+                    probe_points=probe_points,
+                    var=var,
+                )
             nonfinite_count = len(numeric_probes.probe_points) - sum(numeric_probes.finite_mask)
             if nonfinite_count > 0:
                 warnings.append(
@@ -203,6 +232,8 @@ def build_observation(
                 warnings.append(
                     f"numeric_probe_complex:{sum(numeric_probes.complex_mask)}/{sum(numeric_probes.finite_mask)}"
                 )
+        except ObservationTimeoutError:
+            warnings.append("numeric_probe_timeout")
         except Exception as exc:
             warnings.append(f"numeric_probe_failed:{type(exc).__name__}")
 
@@ -281,6 +312,8 @@ def _compute_numeric_probes_from_sympy(
                 raise ValueError("non-finite")
             abs_squared = (real_part * real_part) + (imag_part * imag_part)
             abs_value = math.sqrt(abs_squared)
+        except ObservationTimeoutError:
+            raise
         except Exception:
             residual_real.append(None)
             residual_imag.append(None)
@@ -327,7 +360,7 @@ def _compute_numeric_probes_from_sympy(
 
 
 def _canonicalize_expr(expr: Expr) -> Expr:
-    return canonicalize(expr, variable=_NO_STRIP_VARIABLE)
+    return canonicalize(expr, strip_additive_constants=False)
 
 
 def _apply_token_cap(
@@ -373,3 +406,39 @@ def _validate_residual_mode(residual_mode: str) -> None:
         raise ValueError(
             f"Unsupported residual_mode {residual_mode!r}; expected one of {sorted(RESIDUAL_MODES)}."
         )
+
+
+def _validate_timeout(timeout_seconds: float | None) -> None:
+    if timeout_seconds is not None and timeout_seconds <= 0.0:
+        raise ValueError("observation_timeout_seconds must be > 0 when provided.")
+
+
+@contextmanager
+def _observation_timeout(timeout_seconds: float | None):
+    if (
+        timeout_seconds is None
+        or threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "setitimer")
+    ):
+        yield
+        return
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0.0)
+
+    def _raise_timeout(signum, frame):
+        del signum, frame
+        raise ObservationTimeoutError(
+            f"Observation construction exceeded {timeout_seconds:.3f}s."
+        )
+
+    signal.signal(signal.SIGALRM, _raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0.0:
+            signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])

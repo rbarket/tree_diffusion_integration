@@ -38,7 +38,7 @@ class MutationDatasetSmokeTests(unittest.TestCase):
             for step in range(MUTATIONS_PER_EXAMPLE):
                 with self.subTest(row_index=row_index, step=step):
                     result = mutate_once(current, sigma_small=SIGMA_SMALL, rng=rng)
-                    validated = validate_mutation_result(self, current, result, sigma_small=SIGMA_SMALL)
+                    validate_mutation_result(self, current, result, sigma_small=SIGMA_SMALL)
                     successful_mutations += 1
                     assert result is not None
                     local_like_hits += int(

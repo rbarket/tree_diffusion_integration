@@ -8,6 +8,8 @@ from torch.utils.data import DataLoader
 
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
+from src.tree_diffusion._common import mean_or_none as _mean_or_none
+from src.tree_diffusion._common import move_tensor_batch as _move_tensor_batch
 from src.tree_diffusion.edit_path import structural_distance
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
 from src.tree_diffusion.mutation import replace_subtree_by_node_id
@@ -54,7 +56,11 @@ def run_one_step_edit_diagnostics(
     after_distances: list[float] = []
 
     for _ in range(num_batches):
-        batch = next(iterator)
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            iterator = iter(dataloader)
+            batch = next(iterator)
         working_batch = _move_tensor_batch(batch, device=target_device)
         predicted_ids = _predict_ids(
             model,
@@ -171,23 +177,6 @@ def _extract_edit_tokens(
     if not trimmed:
         return "", []
     return trimmed[0], trimmed[1:]
-
-
-def _move_tensor_batch(
-    batch: Mapping[str, Any],
-    *,
-    device: torch.device,
-) -> dict[str, Any]:
-    return {
-        key: value.to(device) if isinstance(value, torch.Tensor) else value
-        for key, value in batch.items()
-    }
-
-
-def _mean_or_none(values: list[float]) -> float | None:
-    if not values:
-        return None
-    return float(sum(values) / len(values))
 
 
 __all__ = [

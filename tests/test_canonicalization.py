@@ -40,6 +40,13 @@ class CanonicalizationTests(unittest.TestCase):
         expr = self.canonical("add INT+ 7 add x INT+ 2")
         self.assertEqual(serialize_prefix_string(expr), "x")
 
+    def test_top_level_additive_constant_stripping_can_be_disabled(self) -> None:
+        expr = canonicalize(
+            parse_prefix_string("add INT+ 7 add x INT+ 2"),
+            strip_additive_constants=False,
+        )
+        self.assertEqual(serialize_prefix_string(expr), "add INT+ 2 add INT+ 7 x")
+
     def test_non_top_level_constants_are_not_stripped(self) -> None:
         expr = self.canonical("mul add x INT+ 1 INT+ 2")
         self.assertEqual(serialize_prefix_string(expr), "mul INT+ 2 add INT+ 1 x")

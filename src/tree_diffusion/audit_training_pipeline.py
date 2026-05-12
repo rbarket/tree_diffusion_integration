@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -18,6 +17,7 @@ from src.tree_diffusion.train_step import (
     tree_diffusion_train_step,
     validate_tree_diffusion_batch,
 )
+from src.utils.seeding import set_global_seed
 
 
 DEFAULT_CONFIG_PATH = "config/train/tree_diffusion_preflight.json"
@@ -41,7 +41,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     training_cfg = cfg["training"]
     audit_cfg = cfg["audit"]
 
-    _set_seed(int(runtime_cfg["seed"]))
+    set_global_seed(int(runtime_cfg["seed"]))
     device = torch.device(str(runtime_cfg["device"]))
 
     tokenizer = TreeDiffusionTokenizer(max_positions=int(dataset_cfg["max_input_length"]))
@@ -61,6 +61,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         smax=int(dataset_cfg["smax"]),
         rho=float(dataset_cfg["rho"]),
         residual_mode=str(dataset_cfg["residual_mode"]),
+        simplify_symbolic_residual=bool(dataset_cfg.get("simplify_symbolic_residual", True)),
+        allow_complex_constants=bool(dataset_cfg.get("allow_complex_constants", False)),
+        allow_distributional_unary_ops=bool(dataset_cfg.get("allow_distributional_unary_ops", False)),
+        excluded_random_tokens=tuple(dataset_cfg.get("excluded_random_tokens", ())),
+        validate_generated_labels=bool(dataset_cfg.get("validate_generated_labels", False)),
+        max_derivative_tokens=dataset_cfg.get("max_derivative_tokens"),
+        max_residual_tokens=dataset_cfg.get("max_residual_tokens"),
         max_input_length=int(dataset_cfg["max_input_length"]),
         max_target_length=int(dataset_cfg["max_target_length"]),
         base_seed=int(runtime_cfg["seed"]),
@@ -172,13 +179,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ValueError("dataset.batch_size must be >= 1.")
     if int(cfg["audit"]["steps"]) < 1:
         raise ValueError("audit.steps must be >= 1.")
-
-
-def _set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def _is_finite(value: float) -> bool:

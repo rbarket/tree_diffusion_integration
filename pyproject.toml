@@ -9,11 +9,13 @@ description = "Tree diffusion for symbolic integration: phase 1 dataset prep and
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "lightning>=2.6.1",
     "pandas",
     "pyarrow",
     "pytest>=9.0.3",
     "sympy",
     "torch",
+    "wandb>=0.25.1",
 ]
 
 [tool.setuptools.packages.find]

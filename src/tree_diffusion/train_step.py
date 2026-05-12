@@ -5,6 +5,7 @@ from typing import Any, Iterable, Mapping
 
 import torch
 
+from src.tree_diffusion._common import move_tensor_batch as _move_tensor_batch
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
@@ -19,6 +20,13 @@ class TrainStepOutput:
     target_length_mean: float | None = None
     random_init_fraction: float | None = None
     num_mutations_mean: float | None = None
+
+
+@dataclass(frozen=True)
+class TreeDiffusionForwardOutput:
+    loss: torch.Tensor
+    model_output: Any
+    batch: Mapping[str, Any]
 
 
 def validate_tree_diffusion_batch(
@@ -119,27 +127,16 @@ def tree_diffusion_train_step(
     validate_batch: bool = True,
 ) -> TrainStepOutput:
     model.train()
-    working_batch = _move_tensor_batch(batch, device=device)
-    if validate_batch:
-        validate_tree_diffusion_batch(
-            working_batch,
-            pad_token_id=_pad_token_id(model=model, tokenizer=tokenizer),
-        )
-
     optimizer.zero_grad(set_to_none=True)
-    output = model(
-        input_ids=working_batch["input_ids"],
-        input_attention_mask=working_batch["input_attention_mask"],
-        target_ids=working_batch["target_ids"],
-        target_attention_mask=working_batch["target_attention_mask"],
-        labels=working_batch["labels"],
+    forward_output = tree_diffusion_forward_loss(
+        model,
+        batch,
+        tokenizer=tokenizer,
+        device=device,
+        validate_batch=validate_batch,
     )
-    if output.loss is None:
-        raise RuntimeError("Model output loss is None.")
-    if not torch.isfinite(output.loss):
-        raise RuntimeError("Model loss is not finite.")
 
-    output.loss.backward()
+    forward_output.loss.backward()
     if grad_clip_norm is not None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
     grad_norm = compute_gradient_norm(model.parameters())
@@ -147,7 +144,7 @@ def tree_diffusion_train_step(
         raise RuntimeError("No finite nonzero gradients were produced.")
     optimizer.step()
 
-    return _train_step_output(output, working_batch, grad_norm=grad_norm)
+    return train_step_output_from_forward(forward_output, grad_norm=grad_norm)
 
 
 @torch.no_grad()
@@ -160,6 +157,24 @@ def tree_diffusion_eval_step(
     validate_batch: bool = True,
 ) -> TrainStepOutput:
     model.eval()
+    forward_output = tree_diffusion_forward_loss(
+        model,
+        batch,
+        tokenizer=tokenizer,
+        device=device,
+        validate_batch=validate_batch,
+    )
+    return train_step_output_from_forward(forward_output, grad_norm=None)
+
+
+def tree_diffusion_forward_loss(
+    model: TreeDiffusionPolicyModel,
+    batch: Mapping[str, Any],
+    *,
+    tokenizer: TreeDiffusionTokenizer | None = None,
+    device: torch.device | str | None = None,
+    validate_batch: bool = True,
+) -> TreeDiffusionForwardOutput:
     working_batch = _move_tensor_batch(batch, device=device)
     if validate_batch:
         validate_tree_diffusion_batch(
@@ -178,7 +193,23 @@ def tree_diffusion_eval_step(
         raise RuntimeError("Model output loss is None.")
     if not torch.isfinite(output.loss):
         raise RuntimeError("Model loss is not finite.")
-    return _train_step_output(output, working_batch, grad_norm=None)
+    return TreeDiffusionForwardOutput(
+        loss=output.loss,
+        model_output=output,
+        batch=working_batch,
+    )
+
+
+def train_step_output_from_forward(
+    forward_output: TreeDiffusionForwardOutput,
+    *,
+    grad_norm: float | None,
+) -> TrainStepOutput:
+    return _train_step_output(
+        forward_output.model_output,
+        forward_output.batch,
+        grad_norm=grad_norm,
+    )
 
 
 @torch.no_grad()
@@ -259,20 +290,6 @@ def overfit_fixed_batch(
     ]
 
 
-def _move_tensor_batch(
-    batch: Mapping[str, Any],
-    *,
-    device: torch.device | str | None,
-) -> dict[str, Any]:
-    if device is None:
-        return dict(batch)
-    target_device = torch.device(device)
-    return {
-        key: value.to(target_device) if isinstance(value, torch.Tensor) else value
-        for key, value in batch.items()
-    }
-
-
 def _train_step_output(
     model_output: Any,
     batch: Mapping[str, Any],
@@ -351,11 +368,14 @@ def _validate_metadata(batch: Mapping[str, Any], *, batch_size: int) -> None:
 
 
 __all__ = [
+    "TreeDiffusionForwardOutput",
     "TrainStepOutput",
     "compute_gradient_norm",
     "inspect_batch_predictions",
     "overfit_fixed_batch",
+    "train_step_output_from_forward",
     "tree_diffusion_eval_step",
+    "tree_diffusion_forward_loss",
     "tree_diffusion_train_step",
     "validate_tree_diffusion_batch",
 ]

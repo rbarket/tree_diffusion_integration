@@ -37,7 +37,17 @@ _METADATA_FIELDS = (
     "current_prefix",
     "target_integrand_prefix",
     "target_antiderivative_prefix",
+    "selected_node_id",
+    "replacement_subtree_prefix",
+    "resulting_tree_prefix",
+    "distance_before",
+    "distance_after",
+    "observation_status",
+    "warnings",
     "warning_count",
+    "split",
+    "global_example_index",
+    "source",
 )
 
 
@@ -126,12 +136,20 @@ class TreeDiffusionIterableDataset(IterableDataset):
         smax: int = 5,
         rho: float = 0.2,
         residual_mode: str = "both",
-        max_input_length: int = 512,
+        max_input_length: int = 1024,
         max_target_length: int = 128,
         base_seed: int = 0,
         shuffle_pairs: bool = True,
         max_attempts: int = 32,
         max_random_size: int | None = None,
+        observation_timeout_seconds: float | None = None,
+        simplify_symbolic_residual: bool = True,
+        allow_complex_constants: bool = False,
+        allow_distributional_unary_ops: bool = False,
+        excluded_random_tokens: Sequence[str] = (),
+        validate_generated_labels: bool = False,
+        max_derivative_tokens: int | None = None,
+        max_residual_tokens: int | None = None,
         include_metadata: bool = True,
     ) -> None:
         _validate_dataset_args(
@@ -142,6 +160,9 @@ class TreeDiffusionIterableDataset(IterableDataset):
             max_input_length=max_input_length,
             max_target_length=max_target_length,
             max_attempts=max_attempts,
+            observation_timeout_seconds=observation_timeout_seconds,
+            max_derivative_tokens=max_derivative_tokens,
+            max_residual_tokens=max_residual_tokens,
         )
 
         self.pairs = tuple(pairs)
@@ -156,13 +177,25 @@ class TreeDiffusionIterableDataset(IterableDataset):
         self.shuffle_pairs = shuffle_pairs
         self.max_attempts = max_attempts
         self.max_random_size = max_random_size
+        self.observation_timeout_seconds = observation_timeout_seconds
+        self.simplify_symbolic_residual = simplify_symbolic_residual
+        self.allow_complex_constants = allow_complex_constants
+        self.allow_distributional_unary_ops = allow_distributional_unary_ops
+        self.excluded_random_tokens = tuple(str(token) for token in excluded_random_tokens)
+        self.validate_generated_labels = validate_generated_labels
+        self.max_derivative_tokens = max_derivative_tokens
+        self.max_residual_tokens = max_residual_tokens
         self.include_metadata = include_metadata
+
+    def __len__(self) -> int:
+        return len(self.pairs)
 
     def __iter__(self):
         worker_info = get_worker_info()
         worker_id = 0 if worker_info is None else worker_info.id
+        worker_count = 1 if worker_info is None else worker_info.num_workers
         rng = random.Random(self.base_seed + worker_id * _WORKER_SEED_PRIME)
-        ordered_index = 0
+        ordered_index = worker_id
 
         while True:
             last_error: BaseException | None = None
@@ -174,7 +207,7 @@ class TreeDiffusionIterableDataset(IterableDataset):
                     pair_offset = rng.randrange(len(self.pairs))
                 else:
                     pair_offset = ordered_index % len(self.pairs)
-                    ordered_index += 1
+                    ordered_index += worker_count
 
                 pair = self.pairs[pair_offset]
                 last_pair = pair
@@ -194,6 +227,14 @@ class TreeDiffusionIterableDataset(IterableDataset):
                         max_target_length=self.max_target_length,
                         max_random_size=self.max_random_size,
                         max_attempts=self.max_attempts,
+                        observation_timeout_seconds=self.observation_timeout_seconds,
+                        simplify_symbolic_residual=self.simplify_symbolic_residual,
+                        allow_complex_constants=self.allow_complex_constants,
+                        allow_distributional_unary_ops=self.allow_distributional_unary_ops,
+                        excluded_random_tokens=self.excluded_random_tokens,
+                        validate_label=self.validate_generated_labels,
+                        max_derivative_tokens=self.max_derivative_tokens,
+                        max_residual_tokens=self.max_residual_tokens,
                     )
                 except Exception as exc:
                     last_error = exc
@@ -238,27 +279,71 @@ class TreeDiffusionBatchCollator:
 
 
 def make_tree_diffusion_dataloader(
-    pairs: Sequence[IntegrationPair],
+    pairs: Sequence[IntegrationPair] | None = None,
     *,
     tokenizer: TreeDiffusionTokenizer | None = None,
+    precomputed_data_dir: str | Path | None = None,
+    precomputed_split: str = "train",
+    precomputed_limit: int | None = None,
     batch_size: int = 32,
     num_workers: int = 0,
     sigma_small: int = 2,
     smax: int = 5,
     rho: float = 0.2,
     residual_mode: str = "both",
-    max_input_length: int = 512,
+    max_input_length: int = 1024,
     max_target_length: int = 128,
     base_seed: int = 0,
     shuffle_pairs: bool = True,
     max_attempts: int = 32,
     max_random_size: int | None = None,
+    observation_timeout_seconds: float | None = None,
+    simplify_symbolic_residual: bool = True,
+    allow_complex_constants: bool = False,
+    allow_distributional_unary_ops: bool = False,
+    excluded_random_tokens: Sequence[str] = (),
+    validate_generated_labels: bool = False,
+    max_derivative_tokens: int | None = None,
+    max_residual_tokens: int | None = None,
     include_metadata: bool = True,
     pin_memory: bool = False,
 ) -> DataLoader:
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1.")
+    if (pairs is None) == (precomputed_data_dir is None):
+        raise ValueError("Provide exactly one data source: pairs or precomputed_data_dir.")
+    if precomputed_limit is not None and precomputed_limit < 1:
+        raise ValueError("precomputed_limit must be >= 1 when provided.")
 
+    if precomputed_data_dir is not None:
+        from src.tree_diffusion.precomputed_dataset import (
+            PrecomputedTreeDiffusionDataset,
+            load_precomputed_tokenizer_metadata,
+        )
+
+        metadata = load_precomputed_tokenizer_metadata(precomputed_data_dir)
+        tokenizer = tokenizer or _tokenizer_from_metadata(metadata)
+        _validate_tokenizer_matches_metadata(tokenizer, metadata)
+        dataset = PrecomputedTreeDiffusionDataset(
+            precomputed_data_dir,
+            split=precomputed_split,
+            include_metadata=include_metadata,
+            limit=precomputed_limit,
+        )
+        collator = TreeDiffusionBatchCollator(
+            tokenizer=tokenizer,
+            include_metadata=include_metadata,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle_pairs,
+            num_workers=num_workers,
+            collate_fn=collator,
+            pin_memory=pin_memory,
+        )
+
+    assert pairs is not None
     tokenizer = tokenizer or TreeDiffusionTokenizer()
     dataset = TreeDiffusionIterableDataset(
         pairs,
@@ -273,6 +358,14 @@ def make_tree_diffusion_dataloader(
         shuffle_pairs=shuffle_pairs,
         max_attempts=max_attempts,
         max_random_size=max_random_size,
+        observation_timeout_seconds=observation_timeout_seconds,
+        simplify_symbolic_residual=simplify_symbolic_residual,
+        allow_complex_constants=allow_complex_constants,
+        allow_distributional_unary_ops=allow_distributional_unary_ops,
+        excluded_random_tokens=excluded_random_tokens,
+        validate_generated_labels=validate_generated_labels,
+        max_derivative_tokens=max_derivative_tokens,
+        max_residual_tokens=max_residual_tokens,
         include_metadata=include_metadata,
     )
     collator = TreeDiffusionBatchCollator(
@@ -311,7 +404,7 @@ def _parse_pair(
         ) from exc
 
     if canonicalize_pairs:
-        target_integrand = canonicalize(target_integrand)
+        target_integrand = canonicalize(target_integrand, strip_additive_constants=False)
         target_antiderivative = canonicalize(target_antiderivative)
 
     return IntegrationPair(
@@ -346,6 +439,9 @@ def _validate_dataset_args(
     max_input_length: int,
     max_target_length: int,
     max_attempts: int,
+    observation_timeout_seconds: float | None,
+    max_derivative_tokens: int | None,
+    max_residual_tokens: int | None,
 ) -> None:
     if not pairs:
         raise ValueError("pairs must be non-empty.")
@@ -361,6 +457,12 @@ def _validate_dataset_args(
         raise ValueError("rho must satisfy 0.0 <= rho <= 1.0.")
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1.")
+    if observation_timeout_seconds is not None and observation_timeout_seconds <= 0.0:
+        raise ValueError("observation_timeout_seconds must be > 0 when provided.")
+    if max_derivative_tokens is not None and max_derivative_tokens < 1:
+        raise ValueError("max_derivative_tokens must be >= 1 when provided.")
+    if max_residual_tokens is not None and max_residual_tokens < 1:
+        raise ValueError("max_residual_tokens must be >= 1 when provided.")
 
 
 def _example_to_item(
@@ -415,6 +517,40 @@ def _as_tensor(value: Any) -> torch.Tensor:
     if isinstance(value, bool):
         return torch.tensor(value, dtype=torch.bool)
     return torch.tensor(value, dtype=torch.long)
+
+
+def _tokenizer_from_metadata(metadata: Mapping[str, Any]) -> TreeDiffusionTokenizer:
+    return TreeDiffusionTokenizer(
+        max_positions=int(metadata.get("max_positions", 512)),
+        numeric_log_min=int(metadata.get("numeric_log_min", -12)),
+        numeric_log_max=int(metadata.get("numeric_log_max", 12)),
+    )
+
+
+def _validate_tokenizer_matches_metadata(
+    tokenizer: TreeDiffusionTokenizer,
+    metadata: Mapping[str, Any],
+) -> None:
+    expected = {
+        "vocab_size": tokenizer.vocab_size,
+        "pad_id": tokenizer.pad_id,
+        "bos_id": tokenizer.bos_id,
+        "eos_id": tokenizer.eos_id,
+        "unk_id": tokenizer.unk_id,
+        "max_positions": tokenizer.max_positions,
+        "numeric_log_min": tokenizer.numeric_log_min,
+        "numeric_log_max": tokenizer.numeric_log_max,
+    }
+    mismatches = [
+        f"{name}: tokenizer={actual} metadata={metadata[name]}"
+        for name, actual in expected.items()
+        if name in metadata and int(metadata[name]) != int(actual)
+    ]
+    if mismatches:
+        raise ValueError(
+            "Tokenizer is incompatible with precomputed tokenizer_metadata.json: "
+            + "; ".join(mismatches)
+        )
 
 
 def _generation_failure(
