@@ -33,20 +33,35 @@ htmlcov/
 *.egg-info/
 
 # Generated datasets, precomputed shards, audits, training runs, and model artifacts.
-/data/
+# Keep directory scaffolding visible via .gitkeep files, but ignore generated contents.
+!/data/
 /data/**
-/artifacts/
+!/data/**/
+!/data/**/.gitkeep
+!/artifacts/
 /artifacts/**
-/runs/
+!/artifacts/**/
+!/artifacts/**/.gitkeep
+!/runs/
 /runs/**
-/outputs/
+!/runs/**/
+!/runs/**/.gitkeep
+!/outputs/
 /outputs/**
-/checkpoints/
+!/outputs/**/
+!/outputs/**/.gitkeep
+!/checkpoints/
 /checkpoints/**
-/wandb/
+!/checkpoints/**/
+!/checkpoints/**/.gitkeep
+!/wandb/
 /wandb/**
-/mlruns/
+!/wandb/**/
+!/wandb/**/.gitkeep
+!/mlruns/
 /mlruns/**
+!/mlruns/**/
+!/mlruns/**/.gitkeep
 *.parquet
 *.jsonl
 *.log

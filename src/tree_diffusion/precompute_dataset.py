@@ -81,6 +81,10 @@ class ObservationTimeoutRetriesExhausted(RuntimeError):
     pass
 
 
+class WorkerProcessTerminated(RuntimeError):
+    pass
+
+
 @dataclass
 class TreeDiffusionPrecomputeConfig:
     input_data: str
@@ -129,6 +133,7 @@ class TreeDiffusionPrecomputeConfig:
     num_workers: int = 1
     worker_restart_interval: int | None = 1000
     worker_pool_retries: int = 3
+    isolate_broken_pool_tasks: bool = True
 
     def __post_init__(self) -> None:
         self.excluded_random_tokens = tuple(str(token) for token in self.excluded_random_tokens)
@@ -500,7 +505,19 @@ def _iter_precompute_worker_batch_results(
             remaining = remaining[yielded_count:]
             retry_index += 1
             if retry_index > config.worker_pool_retries:
-                raise
+                if not config.isolate_broken_pool_tasks:
+                    raise
+                print(
+                    "precompute_worker_pool_isolate_remaining "
+                    f"batch={batch_index} remaining_tasks={len(remaining)}",
+                    flush=True,
+                )
+                yield from _iter_precompute_isolated_worker_results(
+                    remaining,
+                    config=config,
+                    batch_index=batch_index,
+                )
+                return
             print(
                 "precompute_worker_pool_broken "
                 f"batch={batch_index} retry={retry_index}/{config.worker_pool_retries} "
@@ -514,7 +531,7 @@ def _iter_precompute_worker_results_in_pool(
     *,
     config: TreeDiffusionPrecomputeConfig,
 ) -> Iterator[_PrecomputeWorkerResult]:
-    max_pending = max(config.num_workers * 2, 1)
+    max_pending = max(config.num_workers, 1)
     task_iter = iter(tasks)
     with ProcessPoolExecutor(
         max_workers=config.num_workers,
@@ -538,6 +555,47 @@ def _iter_precompute_worker_results_in_pool(
             yield pending.popleft().result()
             while len(pending) < max_pending and submit_next():
                 pass
+
+
+def _iter_precompute_isolated_worker_results(
+    tasks: Sequence[_PrecomputeTask],
+    *,
+    config: TreeDiffusionPrecomputeConfig,
+    batch_index: int,
+) -> Iterator[_PrecomputeWorkerResult]:
+    for task_index, task in enumerate(tasks):
+        try:
+            with ProcessPoolExecutor(
+                max_workers=1,
+                initializer=_init_precompute_worker,
+                initargs=(config,),
+            ) as executor:
+                yield executor.submit(_run_precompute_task, task).result()
+        except BrokenProcessPool:
+            print(
+                "precompute_worker_task_terminated "
+                f"batch={batch_index} task_offset={task_index} pair_counter={task.pair_counter} "
+                f"example_index_for_pair={task.example_index_for_pair} rng_seed={task.rng_seed}",
+                flush=True,
+            )
+            exc = WorkerProcessTerminated(
+                "worker_process_terminated:"
+                f"pair_counter={task.pair_counter}; "
+                f"pair_index={task.pair.index}; "
+                f"example_index_for_pair={task.example_index_for_pair}; "
+                f"rng_seed={task.rng_seed}"
+            )
+            yield _PrecomputeWorkerResult(
+                task=task,
+                failure=_failure_record(
+                    split=task.split,
+                    pair=task.pair,
+                    pair_counter=task.pair_counter,
+                    example_index_for_pair=task.example_index_for_pair,
+                    rng_seed=task.rng_seed,
+                    exc=exc,
+                ),
+            )
 
 
 def _init_precompute_worker(config: TreeDiffusionPrecomputeConfig) -> None:
@@ -1362,6 +1420,8 @@ def _failure_category(*, exception_type: str, exception_message: str) -> str:
         return "generation_attempts_exhausted"
     if "failed to generate a current candidate" in message:
         return "candidate_generation_failed"
+    if exception_type == WorkerProcessTerminated.__name__ or "worker_process_terminated" in message:
+        return "worker_process_terminated"
     if "unsupported sympy expression" in message:
         return "unsupported_sympy_expression"
     if "unsupported constant symbol" in message:
