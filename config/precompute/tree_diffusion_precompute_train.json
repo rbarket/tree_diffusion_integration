@@ -5,7 +5,5 @@
   "val_limit": null,
   "val_fraction": 0.0,
   "max_input_length": 1024,
-  "num_workers": 32,
-  "worker_restart_interval": 1000,
-  "worker_pool_retries": 3
+  "num_workers": 32
 }

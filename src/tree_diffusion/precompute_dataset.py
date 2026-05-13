@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
@@ -81,10 +80,6 @@ class ObservationTimeoutRetriesExhausted(RuntimeError):
     pass
 
 
-class WorkerProcessTerminated(RuntimeError):
-    pass
-
-
 @dataclass
 class TreeDiffusionPrecomputeConfig:
     input_data: str
@@ -131,9 +126,6 @@ class TreeDiffusionPrecomputeConfig:
     write_failed_examples: bool = True
     failed_examples_limit: int = 100
     num_workers: int = 1
-    worker_restart_interval: int | None = 1000
-    worker_pool_retries: int = 3
-    isolate_broken_pool_tasks: bool = True
 
     def __post_init__(self) -> None:
         self.excluded_random_tokens = tuple(str(token) for token in self.excluded_random_tokens)
@@ -271,10 +263,6 @@ def validate_precompute_config(config: TreeDiffusionPrecomputeConfig) -> None:
         raise ValueError("failed_examples_limit must be >= 0.")
     if config.num_workers < 1:
         raise ValueError("num_workers must be >= 1.")
-    if config.worker_restart_interval is not None and config.worker_restart_interval < 1:
-        raise ValueError("worker_restart_interval must be >= 1 when provided.")
-    if config.worker_pool_retries < 0:
-        raise ValueError("worker_pool_retries must be >= 0.")
 
 
 def split_pairs_for_precompute(
@@ -463,75 +451,7 @@ def _iter_precompute_worker_results(
             yield _run_precompute_task(task, config=config, tokenizer=tokenizer)
         return
 
-    task_iter = iter(tasks)
-    if config.worker_restart_interval is None:
-        yield from _iter_precompute_worker_results_in_pool(task_iter, config=config)
-        return
-
-    batch_index = 0
-    while True:
-        batch = list(islice(task_iter, config.worker_restart_interval))
-        if not batch:
-            return
-        print(
-            "precompute_worker_pool_start "
-            f"batch={batch_index} tasks={len(batch)} num_workers={config.num_workers}",
-            flush=True,
-        )
-        yield from _iter_precompute_worker_batch_results(
-            batch,
-            config=config,
-            batch_index=batch_index,
-        )
-        batch_index += 1
-
-
-def _iter_precompute_worker_batch_results(
-    batch: Sequence[_PrecomputeTask],
-    *,
-    config: TreeDiffusionPrecomputeConfig,
-    batch_index: int,
-) -> Iterator[_PrecomputeWorkerResult]:
-    remaining = list(batch)
-    retry_index = 0
-    while remaining:
-        yielded_count = 0
-        try:
-            for result in _iter_precompute_worker_results_in_pool(iter(remaining), config=config):
-                yielded_count += 1
-                yield result
-            return
-        except BrokenProcessPool:
-            remaining = remaining[yielded_count:]
-            retry_index += 1
-            if retry_index > config.worker_pool_retries:
-                if not config.isolate_broken_pool_tasks:
-                    raise
-                print(
-                    "precompute_worker_pool_isolate_remaining "
-                    f"batch={batch_index} remaining_tasks={len(remaining)}",
-                    flush=True,
-                )
-                yield from _iter_precompute_isolated_worker_results(
-                    remaining,
-                    config=config,
-                    batch_index=batch_index,
-                )
-                return
-            print(
-                "precompute_worker_pool_broken "
-                f"batch={batch_index} retry={retry_index}/{config.worker_pool_retries} "
-                f"remaining_tasks={len(remaining)} num_workers={config.num_workers}",
-                flush=True,
-            )
-
-
-def _iter_precompute_worker_results_in_pool(
-    tasks: Iterator[_PrecomputeTask],
-    *,
-    config: TreeDiffusionPrecomputeConfig,
-) -> Iterator[_PrecomputeWorkerResult]:
-    max_pending = max(config.num_workers, 1)
+    max_pending = max(config.num_workers * 4, 1)
     task_iter = iter(tasks)
     with ProcessPoolExecutor(
         max_workers=config.num_workers,
@@ -555,47 +475,6 @@ def _iter_precompute_worker_results_in_pool(
             yield pending.popleft().result()
             while len(pending) < max_pending and submit_next():
                 pass
-
-
-def _iter_precompute_isolated_worker_results(
-    tasks: Sequence[_PrecomputeTask],
-    *,
-    config: TreeDiffusionPrecomputeConfig,
-    batch_index: int,
-) -> Iterator[_PrecomputeWorkerResult]:
-    for task_index, task in enumerate(tasks):
-        try:
-            with ProcessPoolExecutor(
-                max_workers=1,
-                initializer=_init_precompute_worker,
-                initargs=(config,),
-            ) as executor:
-                yield executor.submit(_run_precompute_task, task).result()
-        except BrokenProcessPool:
-            print(
-                "precompute_worker_task_terminated "
-                f"batch={batch_index} task_offset={task_index} pair_counter={task.pair_counter} "
-                f"example_index_for_pair={task.example_index_for_pair} rng_seed={task.rng_seed}",
-                flush=True,
-            )
-            exc = WorkerProcessTerminated(
-                "worker_process_terminated:"
-                f"pair_counter={task.pair_counter}; "
-                f"pair_index={task.pair.index}; "
-                f"example_index_for_pair={task.example_index_for_pair}; "
-                f"rng_seed={task.rng_seed}"
-            )
-            yield _PrecomputeWorkerResult(
-                task=task,
-                failure=_failure_record(
-                    split=task.split,
-                    pair=task.pair,
-                    pair_counter=task.pair_counter,
-                    example_index_for_pair=task.example_index_for_pair,
-                    rng_seed=task.rng_seed,
-                    exc=exc,
-                ),
-            )
 
 
 def _init_precompute_worker(config: TreeDiffusionPrecomputeConfig) -> None:
@@ -672,8 +551,7 @@ def precompute_split(
         "precompute_split_start "
         f"split={split} pairs={len(pairs)} examples_per_pair={examples_per_pair} "
         f"attempted_target={total_expected} shard_size={config.shard_size} "
-        f"num_workers={config.num_workers} "
-        f"worker_restart_interval={config.worker_restart_interval}",
+        f"num_workers={config.num_workers}",
         flush=True,
     )
 
@@ -1080,8 +958,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--observation-timeout-seconds", type=float, default=None)
     parser.add_argument("--observation-timeout-retries", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument("--worker-restart-interval", type=int, default=None)
-    parser.add_argument("--worker-pool-retries", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-failures", type=int, default=None)
@@ -1102,8 +978,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "observation_timeout_seconds": args.observation_timeout_seconds,
         "observation_timeout_retries": args.observation_timeout_retries,
         "num_workers": args.num_workers,
-        "worker_restart_interval": args.worker_restart_interval,
-        "worker_pool_retries": args.worker_pool_retries,
         "max_failures": args.max_failures,
     }
     for key, value in overrides.items():
@@ -1420,8 +1294,6 @@ def _failure_category(*, exception_type: str, exception_message: str) -> str:
         return "generation_attempts_exhausted"
     if "failed to generate a current candidate" in message:
         return "candidate_generation_failed"
-    if exception_type == WorkerProcessTerminated.__name__ or "worker_process_terminated" in message:
-        return "worker_process_terminated"
     if "unsupported sympy expression" in message:
         return "unsupported_sympy_expression"
     if "unsupported constant symbol" in message:
