@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 import unittest
 
 import torch
@@ -44,7 +45,7 @@ class TreeDiffusionValidationDiagnosticsTests(unittest.TestCase):
     def test_diagnostics_handle_invalid_predictions(self) -> None:
         tokenizer = TreeDiffusionTokenizer(max_positions=128)
         loader = _real_loader(tokenizer)
-        model = _DummyGreedy(tokenizer, ["<bos>", "<bos>", "<eos>"])
+        model = _DummyTokenModel(tokenizer, ["<POS_0>", "add", "x", "<eos>"])
 
         summary = run_one_step_edit_diagnostics(
             model,  # type: ignore[arg-type]
@@ -54,14 +55,15 @@ class TreeDiffusionValidationDiagnosticsTests(unittest.TestCase):
             num_batches=1,
         )
 
-        self.assertEqual(summary.valid_position_rate, 0.0)
+        self.assertEqual(summary.valid_position_rate, 1.0)
+        self.assertEqual(summary.parseable_replacement_rate, 0.0)
         self.assertEqual(summary.applicable_edit_rate, 0.0)
 
     def test_diagnostics_detect_valid_known_edit(self) -> None:
         tokenizer = TreeDiffusionTokenizer(max_positions=128)
         batch = _synthetic_known_edit_batch(tokenizer)
         loader = DataLoader([batch], batch_size=None)
-        model = _DummyGreedy(tokenizer, ["<POS_2>", "INT+", "3", "<eos>"])
+        model = _DummyTokenModel(tokenizer, ["<POS_2>", "INT+", "3", "<eos>"])
 
         summary = run_one_step_edit_diagnostics(
             model,  # type: ignore[arg-type]
@@ -87,27 +89,49 @@ class TreeDiffusionValidationDiagnosticsTests(unittest.TestCase):
         self.assertGreaterEqual(structural_distance(five, three), 1)
 
 
-class _DummyGreedy(torch.nn.Module):
+class _DummyTokenModel(torch.nn.Module):
     def __init__(self, tokenizer: TreeDiffusionTokenizer, tokens: list[str]) -> None:
         super().__init__()
-        self._ids = torch.tensor([tokenizer.encode_tokens(tokens)], dtype=torch.long)
+        self.tokenizer = tokenizer
+        self.tokens = tokens
+        self.config = SimpleNamespace(max_target_length=max(len(tokens), 1))
+        self._decode_step = 0
 
-    def greedy_decode(
+    def encode(
         self,
         input_ids: torch.Tensor,
-        *,
         input_attention_mask: torch.Tensor | None = None,
-        max_length: int | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         del input_attention_mask
-        batch_size = input_ids.size(0)
-        ids = self._ids.to(input_ids.device)
-        if max_length is not None:
-            if ids.size(1) < max_length:
-                pad = ids.new_full((1, max_length - ids.size(1)), 0)
-                ids = torch.cat([ids, pad], dim=1)
-            ids = ids[:, :max_length]
-        return ids.expand(batch_size, -1)
+        memory = torch.zeros(
+            (input_ids.size(0), input_ids.size(1), 1),
+            device=input_ids.device,
+            dtype=torch.float32,
+        )
+        padding = torch.zeros(input_ids.shape, device=input_ids.device, dtype=torch.bool)
+        return memory, padding
+
+    def decode(
+        self,
+        decoder_input_ids: torch.Tensor,
+        *,
+        memory: torch.Tensor,
+        memory_padding_mask: torch.Tensor,
+        target_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del memory, memory_padding_mask, target_attention_mask
+        self._decode_step = decoder_input_ids.size(1) - 1
+        return torch.zeros(
+            (decoder_input_ids.size(0), decoder_input_ids.size(1), 1),
+            device=decoder_input_ids.device,
+            dtype=torch.float32,
+        )
+
+    def lm_head(self, hidden: torch.Tensor) -> torch.Tensor:
+        logits = hidden.new_full((hidden.size(0), hidden.size(1), self.tokenizer.vocab_size), -1000.0)
+        token = self.tokens[self._decode_step] if self._decode_step < len(self.tokens) else "<eos>"
+        logits[:, -1, self.tokenizer.token_to_id[token]] = 10.0
+        return logits
 
 
 def _real_loader(tokenizer: TreeDiffusionTokenizer) -> DataLoader:
@@ -173,6 +197,7 @@ def _synthetic_known_edit_batch(tokenizer: TreeDiffusionTokenizer) -> dict:
         "labels": labels,
         "current_prefix": ["pow x INT+ 5"],
         "target_antiderivative_prefix": ["pow x INT+ 3"],
+        "target_integrand_prefix": ["mul INT+ 3 pow x INT+ 2"],
     }
 
 

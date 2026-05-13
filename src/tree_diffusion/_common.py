@@ -147,7 +147,7 @@ def move_tensor_batch(
 
 
 def diagnostic_metrics(summary: Any) -> dict[str, float | int | None]:
-    return {
+    metrics: dict[str, float | int | None] = {
         "examples": summary.examples,
         "valid_position_rate": summary.valid_position_rate,
         "parseable_replacement_rate": summary.parseable_replacement_rate,
@@ -158,3 +158,13 @@ def diagnostic_metrics(summary: Any) -> dict[str, float | int | None]:
         "mean_structural_distance_before": summary.mean_structural_distance_before,
         "mean_structural_distance_after": summary.mean_structural_distance_after,
     }
+    for name in (
+        "decoded_ok_rate",
+        "nonincreasing_structural_rate",
+        "mean_numeric_residual_before",
+        "mean_numeric_residual_after",
+    ):
+        value = getattr(summary, name, None)
+        if value is not None:
+            metrics[name] = value
+    return metrics

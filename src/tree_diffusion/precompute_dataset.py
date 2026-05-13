@@ -126,6 +126,7 @@ class TreeDiffusionPrecomputeConfig:
     write_failed_examples: bool = True
     failed_examples_limit: int = 100
     num_workers: int = 1
+    worker_restart_interval: int | None = 1000
 
     def __post_init__(self) -> None:
         self.excluded_random_tokens = tuple(str(token) for token in self.excluded_random_tokens)
@@ -263,6 +264,8 @@ def validate_precompute_config(config: TreeDiffusionPrecomputeConfig) -> None:
         raise ValueError("failed_examples_limit must be >= 0.")
     if config.num_workers < 1:
         raise ValueError("num_workers must be >= 1.")
+    if config.worker_restart_interval is not None and config.worker_restart_interval < 1:
+        raise ValueError("worker_restart_interval must be >= 1 when provided.")
 
 
 def split_pairs_for_precompute(
@@ -451,7 +454,31 @@ def _iter_precompute_worker_results(
             yield _run_precompute_task(task, config=config, tokenizer=tokenizer)
         return
 
-    max_pending = max(config.num_workers * 4, 1)
+    task_iter = iter(tasks)
+    if config.worker_restart_interval is None:
+        yield from _iter_precompute_worker_results_in_pool(task_iter, config=config)
+        return
+
+    batch_index = 0
+    while True:
+        batch = list(islice(task_iter, config.worker_restart_interval))
+        if not batch:
+            return
+        print(
+            "precompute_worker_pool_start "
+            f"batch={batch_index} tasks={len(batch)} num_workers={config.num_workers}",
+            flush=True,
+        )
+        yield from _iter_precompute_worker_results_in_pool(iter(batch), config=config)
+        batch_index += 1
+
+
+def _iter_precompute_worker_results_in_pool(
+    tasks: Iterator[_PrecomputeTask],
+    *,
+    config: TreeDiffusionPrecomputeConfig,
+) -> Iterator[_PrecomputeWorkerResult]:
+    max_pending = max(config.num_workers * 2, 1)
     task_iter = iter(tasks)
     with ProcessPoolExecutor(
         max_workers=config.num_workers,
@@ -551,7 +578,8 @@ def precompute_split(
         "precompute_split_start "
         f"split={split} pairs={len(pairs)} examples_per_pair={examples_per_pair} "
         f"attempted_target={total_expected} shard_size={config.shard_size} "
-        f"num_workers={config.num_workers}",
+        f"num_workers={config.num_workers} "
+        f"worker_restart_interval={config.worker_restart_interval}",
         flush=True,
     )
 
@@ -958,6 +986,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--observation-timeout-seconds", type=float, default=None)
     parser.add_argument("--observation-timeout-retries", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--worker-restart-interval", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-failures", type=int, default=None)
@@ -978,6 +1007,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "observation_timeout_seconds": args.observation_timeout_seconds,
         "observation_timeout_retries": args.observation_timeout_retries,
         "num_workers": args.num_workers,
+        "worker_restart_interval": args.worker_restart_interval,
         "max_failures": args.max_failures,
     }
     for key, value in overrides.items():

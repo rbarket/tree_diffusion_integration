@@ -13,6 +13,8 @@
 !/training/**
 !/tests/
 !/tests/**
+!/docs/
+!/docs/tree_diffusion_decoding_and_one_step_eval.md
 !/notebooks/
 !/notebooks/mutation_walkthrough.ipynb
 /notebooks/mutation_walkthrough_presentation.ipynb

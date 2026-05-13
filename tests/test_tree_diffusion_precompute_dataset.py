@@ -44,6 +44,7 @@ class TreeDiffusionPrecomputeDatasetTests(unittest.TestCase):
             self.assertEqual(config.observation_timeout_seconds, 5.0)
             self.assertEqual(config.observation_timeout_retries, 3)
             self.assertEqual(config.num_workers, 1)
+            self.assertEqual(config.worker_restart_interval, 1000)
 
             missing = _write_config(
                 work_dir / "missing.json",
@@ -60,6 +61,7 @@ class TreeDiffusionPrecomputeDatasetTests(unittest.TestCase):
                 ("bad_timeout", {"observation_timeout_seconds": 0.0}, "observation_timeout_seconds"),
                 ("bad_timeout_retries", {"observation_timeout_retries": -1}, "observation_timeout_retries"),
                 ("bad_num_workers", {"num_workers": 0}, "num_workers"),
+                ("bad_worker_restart_interval", {"worker_restart_interval": 0}, "worker_restart_interval"),
             )
             for name, overrides, pattern in invalid_cases:
                 with self.subTest(name=name):

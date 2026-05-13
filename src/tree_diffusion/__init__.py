@@ -8,6 +8,14 @@ from src.tree_diffusion.dataset import (
     make_tree_diffusion_dataloader,
     pairs_from_prefix_rows,
 )
+from src.tree_diffusion.decoding import (
+    DecodedEdit,
+    apply_decoded_edit,
+    decode_edit_tokens,
+    greedy_decode_edit_tokens,
+    predict_greedy_edit,
+    valid_position_token_ids,
+)
 from src.tree_diffusion.edit_path import (
     EditTarget,
     FirstMismatch,
@@ -18,6 +26,11 @@ from src.tree_diffusion.edit_path import (
     structural_distance,
     subtree_size,
     trees_equal,
+)
+from src.tree_diffusion.eval_one_step import (
+    OneStepEditEvaluationSummary,
+    evaluate_one_step_edits,
+    numeric_residual_score,
 )
 from src.tree_diffusion.label_validation import (
     EditLabelValidationResult,
