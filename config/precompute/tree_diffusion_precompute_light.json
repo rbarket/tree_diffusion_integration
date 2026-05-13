@@ -6,5 +6,6 @@
   "shard_size": 1000,
   "max_input_length": 1024,
   "worker_restart_interval": 1000,
+  "worker_pool_retries": 3,
   "overwrite": true
 }

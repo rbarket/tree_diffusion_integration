@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
@@ -127,6 +128,7 @@ class TreeDiffusionPrecomputeConfig:
     failed_examples_limit: int = 100
     num_workers: int = 1
     worker_restart_interval: int | None = 1000
+    worker_pool_retries: int = 3
 
     def __post_init__(self) -> None:
         self.excluded_random_tokens = tuple(str(token) for token in self.excluded_random_tokens)
@@ -266,6 +268,8 @@ def validate_precompute_config(config: TreeDiffusionPrecomputeConfig) -> None:
         raise ValueError("num_workers must be >= 1.")
     if config.worker_restart_interval is not None and config.worker_restart_interval < 1:
         raise ValueError("worker_restart_interval must be >= 1 when provided.")
+    if config.worker_pool_retries < 0:
+        raise ValueError("worker_pool_retries must be >= 0.")
 
 
 def split_pairs_for_precompute(
@@ -469,8 +473,40 @@ def _iter_precompute_worker_results(
             f"batch={batch_index} tasks={len(batch)} num_workers={config.num_workers}",
             flush=True,
         )
-        yield from _iter_precompute_worker_results_in_pool(iter(batch), config=config)
+        yield from _iter_precompute_worker_batch_results(
+            batch,
+            config=config,
+            batch_index=batch_index,
+        )
         batch_index += 1
+
+
+def _iter_precompute_worker_batch_results(
+    batch: Sequence[_PrecomputeTask],
+    *,
+    config: TreeDiffusionPrecomputeConfig,
+    batch_index: int,
+) -> Iterator[_PrecomputeWorkerResult]:
+    remaining = list(batch)
+    retry_index = 0
+    while remaining:
+        yielded_count = 0
+        try:
+            for result in _iter_precompute_worker_results_in_pool(iter(remaining), config=config):
+                yielded_count += 1
+                yield result
+            return
+        except BrokenProcessPool:
+            remaining = remaining[yielded_count:]
+            retry_index += 1
+            if retry_index > config.worker_pool_retries:
+                raise
+            print(
+                "precompute_worker_pool_broken "
+                f"batch={batch_index} retry={retry_index}/{config.worker_pool_retries} "
+                f"remaining_tasks={len(remaining)} num_workers={config.num_workers}",
+                flush=True,
+            )
 
 
 def _iter_precompute_worker_results_in_pool(
@@ -987,6 +1023,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--observation-timeout-retries", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--worker-restart-interval", type=int, default=None)
+    parser.add_argument("--worker-pool-retries", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-failures", type=int, default=None)
@@ -1008,6 +1045,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "observation_timeout_retries": args.observation_timeout_retries,
         "num_workers": args.num_workers,
         "worker_restart_interval": args.worker_restart_interval,
+        "worker_pool_retries": args.worker_pool_retries,
         "max_failures": args.max_failures,
     }
     for key, value in overrides.items():

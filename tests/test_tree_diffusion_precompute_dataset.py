@@ -8,11 +8,15 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pandas as pd
+from concurrent.futures.process import BrokenProcessPool
 
 from src.mathlang.parser import parse_prefix_string
 from src.tree_diffusion.dataset import IntegrationPair
 from src.tree_diffusion.precompute_dataset import (
     TreeDiffusionPrecomputeConfig,
+    _PrecomputeTask,
+    _PrecomputeWorkerResult,
+    _iter_precompute_worker_batch_results,
     _generate_example_with_timeout_retries,
     load_precompute_config,
     precompute_split,
@@ -45,6 +49,7 @@ class TreeDiffusionPrecomputeDatasetTests(unittest.TestCase):
             self.assertEqual(config.observation_timeout_retries, 3)
             self.assertEqual(config.num_workers, 1)
             self.assertEqual(config.worker_restart_interval, 1000)
+            self.assertEqual(config.worker_pool_retries, 3)
 
             missing = _write_config(
                 work_dir / "missing.json",
@@ -62,6 +67,7 @@ class TreeDiffusionPrecomputeDatasetTests(unittest.TestCase):
                 ("bad_timeout_retries", {"observation_timeout_retries": -1}, "observation_timeout_retries"),
                 ("bad_num_workers", {"num_workers": 0}, "num_workers"),
                 ("bad_worker_restart_interval", {"worker_restart_interval": 0}, "worker_restart_interval"),
+                ("bad_worker_pool_retries", {"worker_pool_retries": -1}, "worker_pool_retries"),
             )
             for name, overrides, pattern in invalid_cases:
                 with self.subTest(name=name):
@@ -370,6 +376,47 @@ class TreeDiffusionPrecomputeDatasetTests(unittest.TestCase):
             self.assertEqual(summary["shard_count"], 1)
             self.assertEqual(seen_tasks[0].pair_counter, 0)
             self.assertEqual(seen_tasks[0].example_index_for_pair, 1)
+
+    def test_worker_batch_retries_unemitted_tasks_after_broken_pool(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            parquet = _write_parquet(work_dir / "toy.parquet")
+            config = TreeDiffusionPrecomputeConfig(
+                input_data=str(parquet),
+                output_dir=str(work_dir / "precomputed"),
+                overwrite=True,
+                worker_pool_retries=1,
+            )
+            tasks = [
+                _PrecomputeTask("train", 0, _fake_pairs(1)[0], 0, 123),
+                _PrecomputeTask("train", 0, _fake_pairs(1)[0], 1, 124),
+            ]
+            first_result = _PrecomputeWorkerResult(task=tasks[0], record={"ok": 0})
+            second_result = _PrecomputeWorkerResult(task=tasks[1], record={"ok": 1})
+            calls: list[list[int]] = []
+
+            def fake_pool(task_iter, *, config):
+                current = list(task_iter)
+                calls.append([task.example_index_for_pair for task in current])
+                if len(calls) == 1:
+                    yield first_result
+                    raise BrokenProcessPool("boom")
+                yield second_result
+
+            with patch(
+                "src.tree_diffusion.precompute_dataset._iter_precompute_worker_results_in_pool",
+                side_effect=fake_pool,
+            ):
+                results = list(
+                    _iter_precompute_worker_batch_results(
+                        tasks,
+                        config=config,
+                        batch_index=0,
+                    )
+                )
+
+            self.assertEqual(results, [first_result, second_result])
+            self.assertEqual(calls, [[0, 1], [1]])
 
 
 def _run_tiny_precompute(work_dir: Path) -> Path:
