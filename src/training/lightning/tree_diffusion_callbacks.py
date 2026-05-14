@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -15,6 +14,11 @@ from src.training.lightning.tree_diffusion_module import TreeDiffusionLightningM
 
 EvaluatePolicyFn = Callable[..., dict[str, float]]
 SaveLegacyCheckpointFn = Callable[..., None]
+
+LATEST_LEGACY_CHECKPOINT = "checkpoint_step_latest.pt"
+BEST_LEGACY_CHECKPOINT = "checkpoint_best.pt"
+LAST_LIGHTNING_CHECKPOINT = "last.ckpt"
+BEST_LIGHTNING_CHECKPOINT = "best.ckpt"
 
 
 class TreeDiffusionTrainingCallback(Callback):
@@ -197,6 +201,9 @@ class TreeDiffusionTrainingCallback(Callback):
             tokenizer=pl_module.tokenizer,
             device=pl_module.device,
             num_batches=int(pl_module.cfg.diagnostic_batches),
+            diagnostic_timeout_seconds=pl_module.cfg.diagnostic_timeout_seconds,
+            diagnostic_example_timeout_seconds=pl_module.cfg.diagnostic_example_timeout_seconds,
+            numeric_residual_timeout_seconds=pl_module.cfg.diagnostic_numeric_timeout_seconds,
         )
         diagnostic_row = diagnostic_metrics(diagnostics)
         pl_module.record_eval_tracking_metrics(
@@ -240,18 +247,14 @@ class TreeDiffusionTrainingCallback(Callback):
             pl_module.best_val_loss is None or val_loss < float(pl_module.best_val_loss)
         ):
             pl_module.best_val_loss = val_loss
+            best_path = self.output_dir / BEST_LEGACY_CHECKPOINT
+            pl_module.best_checkpoint = str(best_path)
             lightning_ckpt = self._save_lightning_checkpoint(
                 trainer,
-                filename=f"best-loss-step_{step}.ckpt",
+                filename=BEST_LIGHTNING_CHECKPOINT,
             )
-            if (
-                self._best_lightning_ckpt is not None
-                and self._best_lightning_ckpt != lightning_ckpt
-                and os.path.exists(self._best_lightning_ckpt)
-            ):
-                os.remove(self._best_lightning_ckpt)
+            self._remove_numbered_best_lightning_checkpoints(keep=lightning_ckpt)
             self._best_lightning_ckpt = lightning_ckpt
-            best_path = self.output_dir / "checkpoint_best.pt"
             self._save_legacy(
                 best_path,
                 pl_module,
@@ -259,7 +262,6 @@ class TreeDiffusionTrainingCallback(Callback):
                 extra={"validation_held_out": pl_module.validation_held_out, "val_metrics": val_metrics},
                 lightning_resume_ckpt=lightning_ckpt,
             )
-            pl_module.best_checkpoint = str(best_path)
             print(
                 f"[step {step}] checkpoint_best_saved path={best_path} "
                 f"best_val_loss={val_loss:.4f}",
@@ -274,8 +276,9 @@ class TreeDiffusionTrainingCallback(Callback):
         *,
         step: int,
     ) -> None:
-        lightning_ckpt = self._save_lightning_checkpoint(trainer, filename="last.ckpt")
-        step_path = self.output_dir / f"checkpoint_step_{step}.pt"
+        step_path = self.output_dir / LATEST_LEGACY_CHECKPOINT
+        pl_module.last_checkpoint = str(step_path)
+        lightning_ckpt = self._save_lightning_checkpoint(trainer, filename=LAST_LIGHTNING_CHECKPOINT)
         self._save_legacy(
             step_path,
             pl_module,
@@ -283,7 +286,7 @@ class TreeDiffusionTrainingCallback(Callback):
             extra={"validation_held_out": pl_module.validation_held_out},
             lightning_resume_ckpt=lightning_ckpt,
         )
-        pl_module.last_checkpoint = str(step_path)
+        self._remove_numbered_step_checkpoints(keep=step_path)
         print(f"[step {step}] checkpoint_saved path={step_path}", flush=True)
 
     def _save_last_checkpoint(
@@ -293,23 +296,28 @@ class TreeDiffusionTrainingCallback(Callback):
         *,
         step: int,
     ) -> None:
-        lightning_ckpt = self._save_lightning_checkpoint(trainer, filename="last.ckpt")
-        last_path = self.output_dir / "checkpoint_last.pt"
-        self._save_legacy(
-            last_path,
-            pl_module,
-            step=step,
-            extra={"validation_held_out": pl_module.validation_held_out},
-            lightning_resume_ckpt=lightning_ckpt,
-        )
-        pl_module.last_checkpoint = str(last_path)
-        print(f"checkpoint_last_saved path={last_path}", flush=True)
+        self._save_step_checkpoint(trainer, pl_module, step=step)
+        print(f"checkpoint_latest_saved path={pl_module.last_checkpoint}", flush=True)
 
     def _save_lightning_checkpoint(self, trainer: pl.Trainer, *, filename: str) -> str:
         path = self.output_dir / "lightning" / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         trainer.save_checkpoint(str(path))
         return str(path)
+
+    def _remove_numbered_step_checkpoints(self, *, keep: Path) -> None:
+        keep = keep.resolve()
+        for path in self.output_dir.glob("checkpoint_step_*.pt"):
+            if path.resolve() == keep:
+                continue
+            path.unlink(missing_ok=True)
+
+    def _remove_numbered_best_lightning_checkpoints(self, *, keep: str) -> None:
+        keep_path = Path(keep).resolve()
+        for path in (self.output_dir / "lightning").glob("best-loss-step_*.ckpt"):
+            if path.resolve() == keep_path:
+                continue
+            path.unlink(missing_ok=True)
 
     def _save_legacy(
         self,
@@ -400,6 +408,56 @@ class TreeDiffusionWandbCallback(Callback):
         self.on_fit_end(trainer, pl_module)
 
 
+class TreeDiffusionProgressBar(TQDMProgressBar):
+    """Show global tree-diffusion training progress instead of Lightning's epoch-local count."""
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if not isinstance(pl_module, TreeDiffusionLightningModule):
+            super().on_train_epoch_start(trainer, pl_module)
+            return
+        if self._leave:
+            self.train_progress_bar = self.init_train_tqdm()
+        if self.train_progress_bar is None:
+            return
+
+        current = _global_progress_step(pl_module)
+        total = _global_progress_target(trainer, pl_module)
+        self.train_progress_bar.reset(total=total)
+        self.train_progress_bar.initial = current
+        self.train_progress_bar.n = current
+        self.train_progress_bar.set_description("Training")
+        self.train_progress_bar.set_postfix(self.get_metrics(trainer, pl_module))
+        self.train_progress_bar.refresh()
+
+    def on_train_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        if not isinstance(pl_module, TreeDiffusionLightningModule):
+            super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
+            return
+        del outputs, batch, batch_idx
+        if self.train_progress_bar is None:
+            return
+
+        current = _global_progress_step(pl_module)
+        total = _global_progress_target(trainer, pl_module)
+        if self.train_progress_bar.total != total:
+            self.train_progress_bar.total = total
+        if self._should_update(current, total):
+            delta = current - int(self.train_progress_bar.n)
+            if delta > 0:
+                self.train_progress_bar.update(delta)
+            else:
+                self.train_progress_bar.n = current
+                self.train_progress_bar.refresh()
+            self.train_progress_bar.set_postfix(self.get_metrics(trainer, pl_module))
+
+
 def build_tree_diffusion_callbacks(
     *,
     output_dir: str,
@@ -416,8 +474,20 @@ def build_tree_diffusion_callbacks(
         TreeDiffusionWandbCallback(),
     ]
     if enable_progress_bar:
-        callbacks.append(TQDMProgressBar())
+        callbacks.append(TreeDiffusionProgressBar())
     return callbacks
+
+
+def _global_progress_step(pl_module: TreeDiffusionLightningModule) -> int:
+    return max(0, int(pl_module.legacy_step))
+
+
+def _global_progress_target(trainer: pl.Trainer, pl_module: TreeDiffusionLightningModule) -> int:
+    target_step = max(1, int(pl_module.target_step))
+    max_steps = getattr(trainer, "max_steps", None)
+    if isinstance(max_steps, int) and max_steps > 0:
+        target_step = max(target_step, max_steps)
+    return target_step
 
 
 def _metrics_row(

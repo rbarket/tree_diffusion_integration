@@ -90,7 +90,7 @@ class TreeDiffusionPolicyExperimentTests(unittest.TestCase):
             self.assertIsInstance(summary, dict)
             self.assertTrue((output_dir / "experiment_summary.json").exists())
             self.assertTrue((output_dir / "metrics.jsonl").exists())
-            self.assertTrue((output_dir / "checkpoint_last.pt").exists())
+            self.assertTrue((output_dir / "checkpoint_step_latest.pt").exists())
             for key in (
                 "final_val_loss",
                 "final_val_position_accuracy",
@@ -162,7 +162,7 @@ class TreeDiffusionPolicyExperimentTests(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             work_dir = Path(temp_dir)
             parquet = _write_parquet(work_dir / "toy.parquet")
-            resume_path = work_dir / "checkpoint_last.pt"
+            resume_path = work_dir / "checkpoint_step_latest.pt"
             resume_path.write_bytes(b"placeholder")
             config_path = _write_experiment_config(work_dir / "config.json", parquet)
 

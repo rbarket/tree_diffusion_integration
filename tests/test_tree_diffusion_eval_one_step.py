@@ -15,6 +15,7 @@ from src.tree_diffusion.eval_one_step import (
     numeric_residual_score,
 )
 from src.tree_diffusion.model import TreeDiffusionModelConfig, TreeDiffusionPolicyModel
+from src.tree_diffusion.observation import ObservationTimeoutError
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 from src.tree_diffusion.validation import run_one_step_edit_diagnostics
 
@@ -185,6 +186,53 @@ class TreeDiffusionOneStepEvaluationTests(unittest.TestCase):
             self.assertTrue(hasattr(summary, field_name), field_name)
         self.assertEqual(summary.examples, 1)
         self.assertEqual(summary.exact_target_rate, 1.0)
+
+    def test_diagnostics_count_example_timeouts(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        loader = DataLoader([_synthetic_known_edit_batch(tokenizer)], batch_size=None)
+        model = _correct_edit_model(tokenizer)
+
+        with patch(
+            "src.tree_diffusion.eval_one_step.predict_greedy_edit",
+            side_effect=ObservationTimeoutError("forced"),
+        ):
+            summary = evaluate_one_step_edits(
+                model,  # type: ignore[arg-type]
+                loader,
+                tokenizer=tokenizer,
+                device="cpu",
+                num_batches=1,
+                diagnostic_example_timeout_seconds=1.0,
+            )
+
+        self.assertEqual(summary.examples, 1)
+        self.assertEqual(summary.diagnostic_example_timeout_count, 1)
+        self.assertEqual(summary.status_counts.get("diagnostic_example_timeout"), 1)
+
+    def test_diagnostics_count_numeric_timeouts(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        loader = DataLoader([_synthetic_known_edit_batch(tokenizer)], batch_size=None)
+        model = _correct_edit_model(tokenizer)
+
+        with patch(
+            "src.tree_diffusion.eval_one_step.compute_current_derivative",
+            side_effect=ObservationTimeoutError("forced"),
+        ):
+            summary = evaluate_one_step_edits(
+                model,  # type: ignore[arg-type]
+                loader,
+                tokenizer=tokenizer,
+                device="cpu",
+                num_batches=1,
+                max_decode_length=4,
+                compute_numeric_residual=True,
+                numeric_residual_timeout_seconds=1.0,
+            )
+
+        self.assertEqual(summary.examples, 1)
+        self.assertEqual(summary.numeric_residual_timeout_count, 2)
+        self.assertEqual(summary.status_counts.get("numeric_residual_before_timeout"), 1)
+        self.assertEqual(summary.status_counts.get("numeric_residual_after_timeout"), 1)
 
 
 class _FixedLogitModel(torch.nn.Module):

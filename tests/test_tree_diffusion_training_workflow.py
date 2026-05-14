@@ -78,7 +78,7 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
             self.assertEqual(summary["final_step"], 2)
             self.assertTrue(Path(summary["output_dir"]).exists())
             self.assertTrue((Path(summary["output_dir"]) / "metrics.jsonl").exists())
-            self.assertTrue((Path(summary["output_dir"]) / "checkpoint_last.pt").exists())
+            self.assertTrue((Path(summary["output_dir"]) / "checkpoint_step_latest.pt").exists())
             self.assertTrue((Path(summary["output_dir"]) / "lightning" / "last.ckpt").exists())
             rows = _read_metrics(Path(summary["output_dir"]) / "metrics.jsonl")
             self.assertTrue(any(row["split"] == "train" for row in rows))
@@ -128,7 +128,7 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
             output_dir = work_dir / "run"
             first = TreeDiffusionTrainingConfig(**_config_dict(parquet, output_dir=output_dir, num_epochs=1))
             train_tree_diffusion_policy(first)
-            checkpoint = output_dir / "checkpoint_last.pt"
+            checkpoint = output_dir / "checkpoint_step_latest.pt"
             legacy_checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=False)
             self.assertIn("lightning_resume_ckpt", legacy_checkpoint)
             self.assertTrue(Path(legacy_checkpoint["lightning_resume_ckpt"]).exists())
@@ -163,7 +163,7 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
             summary = train_tree_diffusion_policy(TreeDiffusionTrainingConfig(**resumed_values))
 
             self.assertEqual(summary["final_step"], 4)
-            self.assertTrue((output_dir / "checkpoint_last.pt").exists())
+            self.assertTrue((output_dir / "checkpoint_step_latest.pt").exists())
 
     def test_evaluate_tree_diffusion_policy_returns_averages(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -226,7 +226,7 @@ class TreeDiffusionTrainingWorkflowTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertTrue((output_dir / "metrics.jsonl").exists())
-            self.assertTrue((output_dir / "checkpoint_last.pt").exists())
+            self.assertTrue((output_dir / "checkpoint_step_latest.pt").exists())
 
     def test_compatibility_wrapper_imports(self) -> None:
         import training.workflows.tree_diffusion as compat

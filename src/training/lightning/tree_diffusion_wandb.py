@@ -39,6 +39,9 @@ TREE_DIFFUSION_METRIC_DESCRIPTIONS: dict[str, str] = {
     "diagnostic/exact_target_rate": "Fraction of diagnostic edits exactly reaching the target.",
     "diagnostic/mean_structural_distance_before": "Mean structural distance before diagnostic edits.",
     "diagnostic/mean_structural_distance_after": "Mean structural distance after diagnostic edits.",
+    "diagnostic/diagnostic_example_timeout_count": "Number of diagnostic examples skipped after per-example timeout.",
+    "diagnostic/diagnostic_total_timeout_count": "Number of diagnostic runs stopped after total timeout.",
+    "diagnostic/numeric_residual_timeout_count": "Number of numeric residual computations skipped after timeout.",
 }
 
 

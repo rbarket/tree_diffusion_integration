@@ -141,7 +141,7 @@ class PrecomputedTreeDiffusionDatasetTests(unittest.TestCase):
 
             self.assertEqual(summary["final_step"], 1)
             self.assertTrue((output_dir / "metrics.jsonl").exists())
-            self.assertTrue((output_dir / "checkpoint_last.pt").exists())
+            self.assertTrue((output_dir / "checkpoint_step_latest.pt").exists())
             self.assertTrue((output_dir / "lightning" / "last.ckpt").exists())
             rows = [
                 json.loads(line)

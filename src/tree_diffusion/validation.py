@@ -26,6 +26,9 @@ class OneStepEditDiagnosticSummary:
     mean_numeric_residual_before: float | None = None
     mean_numeric_residual_after: float | None = None
     status_counts: dict[str, int] | None = None
+    diagnostic_example_timeout_count: int = 0
+    diagnostic_total_timeout_count: int = 0
+    numeric_residual_timeout_count: int = 0
 
 
 @torch.no_grad()
@@ -36,6 +39,9 @@ def run_one_step_edit_diagnostics(
     tokenizer: TreeDiffusionTokenizer,
     device: torch.device | str,
     num_batches: int,
+    diagnostic_timeout_seconds: float | None = None,
+    diagnostic_example_timeout_seconds: float | None = None,
+    numeric_residual_timeout_seconds: float | None = None,
 ) -> OneStepEditDiagnosticSummary:
     evaluation = evaluate_one_step_edits(
         model,
@@ -45,6 +51,9 @@ def run_one_step_edit_diagnostics(
         num_batches=num_batches,
         constrain_position=True,
         compute_numeric_residual=True,
+        diagnostic_timeout_seconds=diagnostic_timeout_seconds,
+        diagnostic_example_timeout_seconds=diagnostic_example_timeout_seconds,
+        numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
     )
     return OneStepEditDiagnosticSummary(
         examples=evaluation.examples,
@@ -61,6 +70,9 @@ def run_one_step_edit_diagnostics(
         mean_numeric_residual_before=evaluation.mean_numeric_residual_before,
         mean_numeric_residual_after=evaluation.mean_numeric_residual_after,
         status_counts=dict(evaluation.status_counts),
+        diagnostic_example_timeout_count=evaluation.diagnostic_example_timeout_count,
+        diagnostic_total_timeout_count=evaluation.diagnostic_total_timeout_count,
+        numeric_residual_timeout_count=evaluation.numeric_residual_timeout_count,
     )
 
 

@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, fields
 import json
 import math
 from pathlib import Path
+import time
 from typing import Any, Iterable, Mapping, Sequence
 
 import torch
@@ -30,7 +31,12 @@ from src.tree_diffusion.decoding import (
 )
 from src.tree_diffusion.edit_path import structural_distance
 from src.tree_diffusion.model import TreeDiffusionModelConfig, TreeDiffusionPolicyModel
-from src.tree_diffusion.observation import compute_current_derivative, compute_numeric_probes
+from src.tree_diffusion.observation import (
+    ObservationTimeoutError,
+    _observation_timeout,
+    compute_current_derivative,
+    compute_numeric_probes,
+)
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
 
@@ -50,6 +56,9 @@ class OneStepEditEvaluationSummary:
     mean_numeric_residual_before: float | None
     mean_numeric_residual_after: float | None
     status_counts: dict[str, int]
+    diagnostic_example_timeout_count: int = 0
+    diagnostic_total_timeout_count: int = 0
+    numeric_residual_timeout_count: int = 0
 
 
 @torch.no_grad()
@@ -63,9 +72,15 @@ def evaluate_one_step_edits(
     constrain_position: bool = True,
     max_decode_length: int | None = None,
     compute_numeric_residual: bool = True,
+    diagnostic_timeout_seconds: float | None = None,
+    diagnostic_example_timeout_seconds: float | None = None,
+    numeric_residual_timeout_seconds: float | None = None,
 ) -> OneStepEditEvaluationSummary:
     if num_batches < 1:
         raise ValueError("num_batches must be >= 1.")
+    _validate_optional_timeout("diagnostic_timeout_seconds", diagnostic_timeout_seconds)
+    _validate_optional_timeout("diagnostic_example_timeout_seconds", diagnostic_example_timeout_seconds)
+    _validate_optional_timeout("numeric_residual_timeout_seconds", numeric_residual_timeout_seconds)
 
     target_device = torch.device(device)
     model.to(target_device)
@@ -86,9 +101,21 @@ def evaluate_one_step_edits(
     before_numeric_scores: list[float] = []
     after_numeric_scores: list[float] = []
     status_counts: Counter[str] = Counter()
+    diagnostic_example_timeout_count = 0
+    diagnostic_total_timeout_count = 0
+    numeric_residual_timeout_count = 0
+    deadline = (
+        None
+        if diagnostic_timeout_seconds is None
+        else time.monotonic() + float(diagnostic_timeout_seconds)
+    )
 
     iterator = iter(dataloader)
     for _ in range(num_batches):
+        if deadline is not None and time.monotonic() >= deadline:
+            diagnostic_total_timeout_count += 1
+            status_counts["diagnostic_total_timeout"] += 1
+            break
         try:
             batch = next(iterator)
         except StopIteration:
@@ -108,84 +135,220 @@ def evaluate_one_step_edits(
             raise TypeError("input_attention_mask must be a tensor when provided.")
 
         for row_index in range(_batch_size(input_ids)):
-            examples += 1
-            current_prefix = _required_metadata(batch, "current_prefix", row_index)
-            target_antiderivative_prefix = _required_metadata(
-                batch,
-                "target_antiderivative_prefix",
-                row_index,
-            )
-            target_integrand_prefix = _required_metadata(
-                batch,
-                "target_integrand_prefix",
-                row_index,
-            )
-
-            try:
-                current_tree = canonicalize(parse_prefix_string(current_prefix))
-                target_tree = canonicalize(parse_prefix_string(target_antiderivative_prefix))
-                target_integrand = canonicalize(
-                    parse_prefix_string(target_integrand_prefix),
-                    strip_additive_constants=False,
+            if deadline is not None and time.monotonic() >= deadline:
+                diagnostic_total_timeout_count += 1
+                status_counts["diagnostic_total_timeout"] += 1
+                return _one_step_edit_summary(
+                    examples=examples,
+                    decoded_ok=decoded_ok,
+                    valid_positions=valid_positions,
+                    parseable_replacements=parseable_replacements,
+                    applicable_edits=applicable_edits,
+                    structural_improvements=structural_improvements,
+                    nonincreasing_structural=nonincreasing_structural,
+                    exact_targets=exact_targets,
+                    numeric_improvements=numeric_improvements,
+                    numeric_examples=numeric_examples,
+                    before_distances=before_distances,
+                    after_distances=after_distances,
+                    before_numeric_scores=before_numeric_scores,
+                    after_numeric_scores=after_numeric_scores,
+                    status_counts=status_counts,
+                    diagnostic_example_timeout_count=diagnostic_example_timeout_count,
+                    diagnostic_total_timeout_count=diagnostic_total_timeout_count,
+                    numeric_residual_timeout_count=numeric_residual_timeout_count,
                 )
-            except Exception:
-                status_counts["metadata_parse_failed"] += 1
-                continue
-
-            decoded = predict_greedy_edit(
-                model,
-                _tensor_row(input_ids, row_index),
-                tokenizer=tokenizer,
-                current_tree=current_tree,
-                input_attention_mask=(
-                    None
-                    if input_attention_mask is None
-                    else _tensor_row(input_attention_mask, row_index)
-                ),
-                max_length=max_decode_length,
-                constrain_position=constrain_position,
-                device=target_device,
-            )
-
-            if _has_valid_position(decoded_status=decoded.status):
-                valid_positions += 1
-            if decoded.status == "ok":
-                decoded_ok += 1
-                parseable_replacements += 1
-            else:
-                status_counts[decoded.status] += 1
-                continue
-
+            examples += 1
             try:
-                edited_tree = apply_decoded_edit(current_tree, decoded)
-            except Exception:
-                status_counts["apply_failed"] += 1
+                with _observation_timeout(
+                    _effective_example_timeout(
+                        diagnostic_example_timeout_seconds,
+                        deadline=deadline,
+                    )
+                ):
+                    current_prefix = _required_metadata(batch, "current_prefix", row_index)
+                    target_antiderivative_prefix = _required_metadata(
+                        batch,
+                        "target_antiderivative_prefix",
+                        row_index,
+                    )
+                    target_integrand_prefix = _required_metadata(
+                        batch,
+                        "target_integrand_prefix",
+                        row_index,
+                    )
+
+                    try:
+                        current_tree = canonicalize(parse_prefix_string(current_prefix))
+                        target_tree = canonicalize(parse_prefix_string(target_antiderivative_prefix))
+                        target_integrand = canonicalize(
+                            parse_prefix_string(target_integrand_prefix),
+                            strip_additive_constants=False,
+                        )
+                    except Exception:
+                        status_counts["metadata_parse_failed"] += 1
+                        continue
+
+                    decoded = predict_greedy_edit(
+                        model,
+                        _tensor_row(input_ids, row_index),
+                        tokenizer=tokenizer,
+                        current_tree=current_tree,
+                        input_attention_mask=(
+                            None
+                            if input_attention_mask is None
+                            else _tensor_row(input_attention_mask, row_index)
+                        ),
+                        max_length=max_decode_length,
+                        constrain_position=constrain_position,
+                        device=target_device,
+                    )
+
+                    if _has_valid_position(decoded_status=decoded.status):
+                        valid_positions += 1
+                    if decoded.status == "ok":
+                        decoded_ok += 1
+                        parseable_replacements += 1
+                    else:
+                        status_counts[decoded.status] += 1
+                        continue
+
+                    try:
+                        edited_tree = apply_decoded_edit(current_tree, decoded)
+                    except Exception:
+                        status_counts["apply_failed"] += 1
+                        continue
+
+                    applicable_edits += 1
+                    status_counts["ok"] += 1
+
+                    before = float(structural_distance(current_tree, target_tree))
+                    after = float(structural_distance(edited_tree, target_tree))
+                    before_distances.append(before)
+                    after_distances.append(after)
+                    if after < before:
+                        structural_improvements += 1
+                    if after <= before:
+                        nonincreasing_structural += 1
+                    if canonicalize(edited_tree) == target_tree:
+                        exact_targets += 1
+
+                    if compute_numeric_residual:
+                        before_score, before_timed_out = _numeric_residual_score_with_status(
+                            current_tree,
+                            target_integrand,
+                            timeout_seconds=numeric_residual_timeout_seconds,
+                        )
+                        after_score, after_timed_out = _numeric_residual_score_with_status(
+                            edited_tree,
+                            target_integrand,
+                            timeout_seconds=numeric_residual_timeout_seconds,
+                        )
+                        numeric_residual_timeout_count += int(before_timed_out) + int(after_timed_out)
+                        if before_timed_out:
+                            status_counts["numeric_residual_before_timeout"] += 1
+                        if after_timed_out:
+                            status_counts["numeric_residual_after_timeout"] += 1
+                        if before_score is not None and after_score is not None:
+                            numeric_examples += 1
+                            before_numeric_scores.append(before_score)
+                            after_numeric_scores.append(after_score)
+                            if after_score < before_score:
+                                numeric_improvements += 1
+            except ObservationTimeoutError:
+                diagnostic_example_timeout_count += 1
+                status_counts["diagnostic_example_timeout"] += 1
                 continue
 
-            applicable_edits += 1
-            status_counts["ok"] += 1
+    return _one_step_edit_summary(
+        examples=examples,
+        decoded_ok=decoded_ok,
+        valid_positions=valid_positions,
+        parseable_replacements=parseable_replacements,
+        applicable_edits=applicable_edits,
+        structural_improvements=structural_improvements,
+        nonincreasing_structural=nonincreasing_structural,
+        exact_targets=exact_targets,
+        numeric_improvements=numeric_improvements,
+        numeric_examples=numeric_examples,
+        before_distances=before_distances,
+        after_distances=after_distances,
+        before_numeric_scores=before_numeric_scores,
+        after_numeric_scores=after_numeric_scores,
+        status_counts=status_counts,
+        diagnostic_example_timeout_count=diagnostic_example_timeout_count,
+        diagnostic_total_timeout_count=diagnostic_total_timeout_count,
+        numeric_residual_timeout_count=numeric_residual_timeout_count,
+    )
 
-            before = float(structural_distance(current_tree, target_tree))
-            after = float(structural_distance(edited_tree, target_tree))
-            before_distances.append(before)
-            after_distances.append(after)
-            if after < before:
-                structural_improvements += 1
-            if after <= before:
-                nonincreasing_structural += 1
-            if canonicalize(edited_tree) == target_tree:
-                exact_targets += 1
 
-            if compute_numeric_residual:
-                before_score = numeric_residual_score(current_tree, target_integrand)
-                after_score = numeric_residual_score(edited_tree, target_integrand)
-                if before_score is not None and after_score is not None:
-                    numeric_examples += 1
-                    before_numeric_scores.append(before_score)
-                    after_numeric_scores.append(after_score)
-                    if after_score < before_score:
-                        numeric_improvements += 1
+def numeric_residual_score(
+    antiderivative: Expr,
+    target_integrand: Expr,
+    *,
+    probe_points: Sequence[float] | None = None,
+    timeout_seconds: float | None = None,
+) -> float | None:
+    score, _ = _numeric_residual_score_with_status(
+        antiderivative,
+        target_integrand,
+        probe_points=probe_points,
+        timeout_seconds=timeout_seconds,
+    )
+    return score
 
+
+def _numeric_residual_score_with_status(
+    antiderivative: Expr,
+    target_integrand: Expr,
+    *,
+    probe_points: Sequence[float] | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[float | None, bool]:
+    try:
+        with _observation_timeout(timeout_seconds):
+            current_derivative = compute_current_derivative(antiderivative)
+            probes = compute_numeric_probes(
+                current_derivative,
+                target_integrand,
+                probe_points=probe_points,
+            )
+    except ObservationTimeoutError:
+        return None, True
+    except Exception:
+        return None, False
+
+    finite_squared_abs = [
+        float(value)
+        for is_finite, value in zip(probes.finite_mask, probes.residual_abs_squared)
+        if is_finite and value is not None and math.isfinite(float(value))
+    ]
+    if not finite_squared_abs:
+        return None, False
+    return sum(finite_squared_abs) / len(finite_squared_abs), False
+
+
+def _one_step_edit_summary(
+    *,
+    examples: int,
+    decoded_ok: int,
+    valid_positions: int,
+    parseable_replacements: int,
+    applicable_edits: int,
+    structural_improvements: int,
+    nonincreasing_structural: int,
+    exact_targets: int,
+    numeric_improvements: int,
+    numeric_examples: int,
+    before_distances: Sequence[float],
+    after_distances: Sequence[float],
+    before_numeric_scores: Sequence[float],
+    after_numeric_scores: Sequence[float],
+    status_counts: Counter[str],
+    diagnostic_example_timeout_count: int,
+    diagnostic_total_timeout_count: int,
+    numeric_residual_timeout_count: int,
+) -> OneStepEditEvaluationSummary:
     return OneStepEditEvaluationSummary(
         examples=examples,
         decoded_ok_rate=_rate(decoded_ok, examples),
@@ -203,33 +366,28 @@ def evaluate_one_step_edits(
         mean_numeric_residual_before=_mean_or_none(before_numeric_scores),
         mean_numeric_residual_after=_mean_or_none(after_numeric_scores),
         status_counts=dict(status_counts),
+        diagnostic_example_timeout_count=diagnostic_example_timeout_count,
+        diagnostic_total_timeout_count=diagnostic_total_timeout_count,
+        numeric_residual_timeout_count=numeric_residual_timeout_count,
     )
 
 
-def numeric_residual_score(
-    antiderivative: Expr,
-    target_integrand: Expr,
+def _effective_example_timeout(
+    timeout_seconds: float | None,
     *,
-    probe_points: Sequence[float] | None = None,
+    deadline: float | None,
 ) -> float | None:
-    try:
-        current_derivative = compute_current_derivative(antiderivative)
-        probes = compute_numeric_probes(
-            current_derivative,
-            target_integrand,
-            probe_points=probe_points,
-        )
-    except Exception:
-        return None
+    if deadline is None:
+        return timeout_seconds
+    remaining = max(0.001, deadline - time.monotonic())
+    if timeout_seconds is None:
+        return remaining
+    return min(float(timeout_seconds), remaining)
 
-    finite_squared_abs = [
-        float(value)
-        for is_finite, value in zip(probes.finite_mask, probes.residual_abs_squared)
-        if is_finite and value is not None and math.isfinite(float(value))
-    ]
-    if not finite_squared_abs:
-        return None
-    return sum(finite_squared_abs) / len(finite_squared_abs)
+
+def _validate_optional_timeout(name: str, value: float | None) -> None:
+    if value is not None and value <= 0.0:
+        raise ValueError(f"{name} must be > 0 when provided.")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

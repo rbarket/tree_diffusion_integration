@@ -93,6 +93,9 @@ class TreeDiffusionTrainingConfig:
     checkpoint_every: int = 1000
     val_batches: int = 20
     diagnostic_batches: int = 5
+    diagnostic_timeout_seconds: float | None = 120.0
+    diagnostic_example_timeout_seconds: float | None = 5.0
+    diagnostic_numeric_timeout_seconds: float | None = 2.0
 
     resume_from: str | None = None
     save_best: bool = True
@@ -164,7 +167,10 @@ def train_tree_diffusion_policy(config: TreeDiffusionTrainingConfig) -> dict[str
         "training_schedule "
         f"log_every={config.log_every} val_every={config.val_every} "
         f"checkpoint_every={config.checkpoint_every} "
-        f"val_batches={config.val_batches} diagnostic_batches={config.diagnostic_batches}"
+        f"val_batches={config.val_batches} diagnostic_batches={config.diagnostic_batches} "
+        f"diagnostic_timeout_seconds={config.diagnostic_timeout_seconds} "
+        f"diagnostic_example_timeout_seconds={config.diagnostic_example_timeout_seconds} "
+        f"diagnostic_numeric_timeout_seconds={config.diagnostic_numeric_timeout_seconds}"
     )
     _log_training(
         "data_config "
@@ -645,6 +651,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--precision", default=None, help="Override Lightning precision.")
     parser.add_argument("--log-every-n-steps", type=int, default=None)
     parser.add_argument("--num-sanity-val-steps", type=int, default=None)
+    parser.add_argument("--diagnostic-timeout-seconds", type=float, default=None)
+    parser.add_argument("--diagnostic-example-timeout-seconds", type=float, default=None)
+    parser.add_argument("--diagnostic-numeric-timeout-seconds", type=float, default=None)
     parser.add_argument("--enable-progress-bar", type=_parse_bool, default=None)
     parser.add_argument("--deterministic", type=_parse_bool, default=None)
     parser.add_argument("--enable-wandb", type=_parse_bool, default=None)
@@ -682,6 +691,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "precision": args.precision,
         "log_every_n_steps": args.log_every_n_steps,
         "num_sanity_val_steps": args.num_sanity_val_steps,
+        "diagnostic_timeout_seconds": args.diagnostic_timeout_seconds,
+        "diagnostic_example_timeout_seconds": args.diagnostic_example_timeout_seconds,
+        "diagnostic_numeric_timeout_seconds": args.diagnostic_numeric_timeout_seconds,
         "enable_progress_bar": args.enable_progress_bar,
         "deterministic": args.deterministic,
         "enable_wandb": args.enable_wandb,
@@ -760,6 +772,14 @@ def _validate_training_config(config: TreeDiffusionTrainingConfig) -> None:
     for name in ("log_every", "val_every", "checkpoint_every", "val_batches", "diagnostic_batches"):
         if getattr(config, name) < 1:
             raise ValueError(f"{name} must be >= 1.")
+    for name in (
+        "diagnostic_timeout_seconds",
+        "diagnostic_example_timeout_seconds",
+        "diagnostic_numeric_timeout_seconds",
+    ):
+        value = getattr(config, name)
+        if value is not None and value <= 0.0:
+            raise ValueError(f"{name} must be > 0 when provided.")
     if config.log_every_n_steps is not None and config.log_every_n_steps < 1:
         raise ValueError("log_every_n_steps must be >= 1 when provided.")
     if config.num_sanity_val_steps < 0:
