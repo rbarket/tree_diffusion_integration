@@ -20,6 +20,7 @@ from src.tree_diffusion.precompute_dataset import (
     precompute_tree_diffusion_dataset,
     split_pairs_for_precompute,
 )
+from src.tree_diffusion.precomputed_dataset import PrecomputedTreeDiffusionDataset
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 from tests.tree_diffusion_test_utils import run_tiny_precompute, write_extended_toy_parquet
 
@@ -187,6 +188,150 @@ class TreeDiffusionPrecomputeDatasetTests(unittest.TestCase):
             self.assertEqual(len(target_ids), 64)
             self.assertEqual(len(labels), 64)
             self.assertLessEqual(int(row["distance_after"]), int(row["distance_before"]))
+
+    def test_val_only_precompute_writes_usable_partial_metadata(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            parquet = _write_parquet(work_dir / "toy.parquet")
+            output_dir = work_dir / "precomputed"
+            config = TreeDiffusionPrecomputeConfig(
+                input_data=str(parquet),
+                output_dir=str(output_dir),
+                train_limit=4,
+                val_limit=1,
+                val_fraction=0.2,
+                examples_per_pair_train=1,
+                examples_per_pair_val=1,
+                shard_size=2,
+                overwrite=True,
+                splits=("val",),
+                max_input_length=256,
+                max_target_length=64,
+                max_positions=128,
+            )
+
+            precompute_tree_diffusion_dataset(config)
+
+            metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["requested_splits"], ["val"])
+            self.assertEqual(metadata["total_train_examples"], 0)
+            self.assertGreater(metadata["total_val_examples"], 0)
+            self.assertFalse(list((output_dir / "train").glob("shard_*.parquet")))
+            self.assertTrue(list((output_dir / "val").glob("shard_*.parquet")))
+            self.assertEqual(len(PrecomputedTreeDiffusionDataset(output_dir, split="val")), 1)
+
+    def test_invalid_precompute_splits_fail_clearly(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            parquet = _write_parquet(work_dir / "toy.parquet")
+
+            with self.assertRaisesRegex(ValueError, "splits"):
+                TreeDiffusionPrecomputeConfig(
+                    input_data=str(parquet),
+                    output_dir=str(work_dir / "precomputed"),
+                    overwrite=True,
+                    splits=("val", "val"),
+                )
+            with self.assertRaisesRegex(ValueError, "splits"):
+                TreeDiffusionPrecomputeConfig(
+                    input_data=str(parquet),
+                    output_dir=str(work_dir / "other"),
+                    overwrite=True,
+                    splits=("test",),
+                )
+
+    def test_resume_can_generate_val_after_train_only_without_overlapping_train(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            parquet = _write_parquet(work_dir / "toy.parquet")
+            output_dir = work_dir / "precomputed"
+            first = TreeDiffusionPrecomputeConfig(
+                input_data=str(parquet),
+                output_dir=str(output_dir),
+                train_limit=4,
+                val_limit=1,
+                val_fraction=0.2,
+                examples_per_pair_train=1,
+                examples_per_pair_val=1,
+                shard_size=2,
+                overwrite=True,
+                splits=("train",),
+                max_input_length=256,
+                max_target_length=64,
+                max_positions=128,
+            )
+            precompute_tree_diffusion_dataset(first)
+            train_rows_before = _read_split_rows(output_dir, "train")
+            self.assertFalse(list((output_dir / "val").glob("shard_*.parquet")))
+
+            second = TreeDiffusionPrecomputeConfig(
+                input_data=str(parquet),
+                output_dir=str(output_dir),
+                train_limit=4,
+                val_limit=1,
+                val_fraction=0.2,
+                examples_per_pair_train=1,
+                examples_per_pair_val=1,
+                shard_size=2,
+                resume=True,
+                splits=("val",),
+                max_input_length=256,
+                max_target_length=64,
+                max_positions=128,
+            )
+            precompute_tree_diffusion_dataset(second)
+
+            train_rows_after = _read_split_rows(output_dir, "train")
+            val_rows = _read_split_rows(output_dir, "val")
+            self.assertEqual(
+                train_rows_before["rng_seed"].tolist(),
+                train_rows_after["rng_seed"].tolist(),
+            )
+            self.assertGreater(len(val_rows), 0)
+
+    def test_validation_trajectory_json_records_forward_and_repair_steps(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            parquet = _write_parquet(work_dir / "toy.parquet")
+            output_dir = work_dir / "precomputed"
+            config = TreeDiffusionPrecomputeConfig(
+                input_data=str(parquet),
+                output_dir=str(output_dir),
+                train_limit=4,
+                val_limit=1,
+                val_fraction=0.2,
+                examples_per_pair_train=1,
+                examples_per_pair_val=1,
+                shard_size=2,
+                overwrite=True,
+                splits=("val",),
+                val_trajectory_mode="forward_and_repair",
+                rho=0.0,
+                smax=2,
+                max_input_length=256,
+                max_target_length=64,
+                max_positions=128,
+            )
+
+            precompute_tree_diffusion_dataset(config)
+
+            val_rows = _read_split_rows(output_dir, "val")
+            row = val_rows.iloc[0]
+            trajectory = json.loads(row["trajectory_json"])
+            self.assertEqual(trajectory["mode"], "forward_and_repair")
+            self.assertFalse(trajectory["forward"]["used_random_init"])
+            self.assertTrue(trajectory["forward"]["complete"])
+            self.assertEqual(
+                trajectory["forward"]["steps"][-1]["after_prefix"],
+                row["current_antiderivative_prefix"],
+            )
+            first_repair = trajectory["repair"]["steps"][0]
+            self.assertEqual(first_repair["selected_node_id"], int(row["selected_node_id"]))
+            self.assertEqual(
+                first_repair["replacement_subtree_prefix"],
+                row["replacement_subtree_prefix"],
+            )
+            self.assertEqual(first_repair["after_prefix"], row["resulting_tree_prefix"])
 
     def test_failure_handling_writes_summary_before_raising(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -48,6 +48,8 @@ _METADATA_FIELDS = (
     "split",
     "global_example_index",
     "source",
+    "trajectory_json",
+    "trajectory",
 )
 
 

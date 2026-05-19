@@ -30,10 +30,35 @@ Replacement subtree generation is still unconstrained. The decoder emits tokens 
 
 Current limitations:
 
-- No beam search.
+- No tree-state beam search.
 - No multi-step repair.
 - No full grammar-constrained replacement decoding.
 - No precompute, objective, architecture, or checkpoint format changes.
+
+## Invalid Replacement Handling
+
+`decode_edit_tokens(...)` does not repair invalid token strings. It removes trailing `<pad>`, ignores one leading `<bos>`, optionally truncates at `<eos>`, then requires a valid current-tree position token followed by replacement tokens that parse as exactly one complete prefix expression.
+
+Invalid replacement strings return `replacement_parse_failed`. One-step evaluation counts these failures rather than silently truncating, padding, or guessing a replacement.
+
+Examples:
+
+```text
+<POS_3> pow x <eos>       -> replacement_parse_failed
+<POS_3> INT+ 3 x <eos>   -> replacement_parse_failed
+<POS_3> INT+ <eos>       -> replacement_parse_failed
+<POS_3> <eos>            -> missing_replacement
+```
+
+Greedy repair or search should request top-k edit candidates and skip invalid/apply-failing candidates at selection time.
+
+```text
+top candidate:    <POS_3> pow x <eos>   -> replacement_parse_failed
+second candidate: <POS_3> INT+ 3 <eos>  -> ok
+inference:        use the second candidate if it applies successfully
+```
+
+This is not full constrained decoding. The first position token can be constrained to valid current-tree positions, but replacement decoding remains unconstrained. Top-k retry makes inference more robust while keeping invalid candidate strings visible in diagnostics. Full grammar-constrained replacement decoding can later prevent many invalid strings before parsing.
 
 ## Metrics
 
@@ -74,6 +99,16 @@ python -m src.tree_diffusion.eval_one_step \
   --checkpoint runs/tree_diffusion/checkpoint_best.pt \
   --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
   --no-constrain-position
+```
+
+Evaluate top-k edit proposals and score the first applicable candidate:
+
+```bash
+python -m src.tree_diffusion.eval_one_step \
+  --checkpoint runs/tree_diffusion/checkpoint_best.pt \
+  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
+  --candidate-k 8 \
+  --use-first-applicable-candidate
 ```
 
 Smoke-test with a random model only when explicit:

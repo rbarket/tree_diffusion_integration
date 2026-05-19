@@ -76,6 +76,7 @@ class PrecomputedTreeDiffusionDataset(Dataset):
 
         if self.include_metadata:
             warnings = _json_list(row.get("warnings_json", "[]"))
+            trajectory_json = _optional_string(row.get("trajectory_json"))
             item.update(
                 {
                     "input_tokens": _json_list(row["input_tokens_json"]),
@@ -96,6 +97,9 @@ class PrecomputedTreeDiffusionDataset(Dataset):
                     "source": _optional_string(row.get("source")),
                 }
             )
+            if trajectory_json is not None:
+                item["trajectory_json"] = trajectory_json
+                item["trajectory"] = json.loads(trajectory_json)
 
         return item
 

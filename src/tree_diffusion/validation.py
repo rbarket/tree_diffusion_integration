@@ -29,6 +29,10 @@ class OneStepEditDiagnosticSummary:
     diagnostic_example_timeout_count: int = 0
     diagnostic_total_timeout_count: int = 0
     numeric_residual_timeout_count: int = 0
+    any_decoded_ok_rate: float | None = None
+    any_applicable_edit_rate: float | None = None
+    any_structural_improvement_rate: float | None = None
+    first_applicable_rank_mean: float | None = None
 
 
 @torch.no_grad()
@@ -42,6 +46,8 @@ def run_one_step_edit_diagnostics(
     diagnostic_timeout_seconds: float | None = None,
     diagnostic_example_timeout_seconds: float | None = None,
     numeric_residual_timeout_seconds: float | None = None,
+    candidate_k: int = 1,
+    use_first_applicable_candidate: bool = False,
 ) -> OneStepEditDiagnosticSummary:
     evaluation = evaluate_one_step_edits(
         model,
@@ -54,6 +60,8 @@ def run_one_step_edit_diagnostics(
         diagnostic_timeout_seconds=diagnostic_timeout_seconds,
         diagnostic_example_timeout_seconds=diagnostic_example_timeout_seconds,
         numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
+        candidate_k=candidate_k,
+        use_first_applicable_candidate=use_first_applicable_candidate,
     )
     return OneStepEditDiagnosticSummary(
         examples=evaluation.examples,
@@ -73,6 +81,14 @@ def run_one_step_edit_diagnostics(
         diagnostic_example_timeout_count=evaluation.diagnostic_example_timeout_count,
         diagnostic_total_timeout_count=evaluation.diagnostic_total_timeout_count,
         numeric_residual_timeout_count=evaluation.numeric_residual_timeout_count,
+        any_decoded_ok_rate=getattr(evaluation, "any_decoded_ok_rate", None),
+        any_applicable_edit_rate=getattr(evaluation, "any_applicable_edit_rate", None),
+        any_structural_improvement_rate=getattr(
+            evaluation,
+            "any_structural_improvement_rate",
+            None,
+        ),
+        first_applicable_rank_mean=getattr(evaluation, "first_applicable_rank_mean", None),
     )
 
 

@@ -9,9 +9,17 @@ from src.mathlang.canonicalize import canonicalize
 from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.edit_path import EditTarget, first_edit_toward_target, structural_distance
 from src.tree_diffusion.label_validation import validate_edit_label_progress
-from src.tree_diffusion.mutation import mutate_once, sample_random_expr
+from src.tree_diffusion.mutation import MutationResult, mutate_once, sample_random_expr
 from src.tree_diffusion.observation import Observation, build_observation
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
+
+
+@dataclass(frozen=True)
+class CurrentCandidateTrace:
+    current_antiderivative: Expr
+    num_mutations: int
+    used_random_init: bool
+    forward_mutations: tuple[MutationResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,7 @@ class TreeDiffusionTrainingExample:
     used_random_init: bool = False
     attempts: int = 1
     warnings: tuple[str, ...] = ()
+    forward_mutations: tuple[MutationResult, ...] = ()
 
 
 def generate_current_candidate(
@@ -43,7 +52,38 @@ def generate_current_candidate(
     allow_complex_constants: bool = False,
     allow_distributional_unary_ops: bool = False,
     excluded_random_tokens: Collection[str] | None = None,
-) -> tuple[Expr, int, bool]:
+    return_trace: bool = False,
+) -> tuple[Expr, int, bool] | CurrentCandidateTrace:
+    trace = generate_current_candidate_with_trace(
+        target_antiderivative,
+        rng=rng,
+        sigma_small=sigma_small,
+        smax=smax,
+        rho=rho,
+        max_random_size=max_random_size,
+        max_attempts=max_attempts,
+        allow_complex_constants=allow_complex_constants,
+        allow_distributional_unary_ops=allow_distributional_unary_ops,
+        excluded_random_tokens=excluded_random_tokens,
+    )
+    if return_trace:
+        return trace
+    return trace.current_antiderivative, trace.num_mutations, trace.used_random_init
+
+
+def generate_current_candidate_with_trace(
+    target_antiderivative: Expr,
+    *,
+    rng: random.Random | None = None,
+    sigma_small: int = 2,
+    smax: int = 5,
+    rho: float = 0.2,
+    max_random_size: int | None = None,
+    max_attempts: int = 32,
+    allow_complex_constants: bool = False,
+    allow_distributional_unary_ops: bool = False,
+    excluded_random_tokens: Collection[str] | None = None,
+) -> CurrentCandidateTrace:
     _validate_generation_args(
         sigma_small=sigma_small,
         smax=smax,
@@ -69,12 +109,16 @@ def generate_current_candidate(
                 excluded_random_tokens=excluded_random_tokens,
             )
             if canonicalize(current) != target:
-                return current, 0, True
+                return CurrentCandidateTrace(
+                    current_antiderivative=current,
+                    num_mutations=0,
+                    used_random_init=True,
+                )
             continue
 
         requested_mutations = rng.randint(1, smax)
         current = target
-        successful_mutations = 0
+        forward_mutations: list[MutationResult] = []
         for _ in range(requested_mutations):
             mutation = mutate_once(
                 current,
@@ -87,11 +131,16 @@ def generate_current_candidate(
             if mutation is None:
                 break
             current = mutation.mutated_expr
-            successful_mutations += 1
+            forward_mutations.append(mutation)
 
         current = canonicalize(current)
-        if successful_mutations > 0 and current != target:
-            return current, successful_mutations, False
+        if forward_mutations and current != target:
+            return CurrentCandidateTrace(
+                current_antiderivative=current,
+                num_mutations=len(forward_mutations),
+                used_random_init=False,
+                forward_mutations=tuple(forward_mutations),
+            )
 
     raise RuntimeError(
         "Failed to generate a current candidate different from target "
@@ -142,7 +191,7 @@ def generate_training_example(
     last_failure: str | None = None
 
     for attempt in range(1, max_attempts + 1):
-        current_antiderivative, num_mutations, used_random_init = generate_current_candidate(
+        candidate_result = generate_current_candidate(
             canonical_target_antiderivative,
             rng=rng,
             sigma_small=sigma_small,
@@ -153,7 +202,18 @@ def generate_training_example(
             allow_complex_constants=allow_complex_constants,
             allow_distributional_unary_ops=allow_distributional_unary_ops,
             excluded_random_tokens=excluded_random_tokens,
+            return_trace=True,
         )
+        if isinstance(candidate_result, CurrentCandidateTrace):
+            candidate = candidate_result
+        else:
+            current_antiderivative, num_mutations, used_random_init = candidate_result
+            candidate = CurrentCandidateTrace(
+                current_antiderivative=current_antiderivative,
+                num_mutations=num_mutations,
+                used_random_init=used_random_init,
+            )
+        current_antiderivative = candidate.current_antiderivative
 
         edit_target = first_edit_toward_target(
             current_antiderivative,
@@ -226,10 +286,11 @@ def generate_training_example(
             target_tokens=target_tokens,
             input_ids=input_ids,
             target_ids=target_ids,
-            num_mutations=num_mutations,
-            used_random_init=used_random_init,
+            num_mutations=candidate.num_mutations,
+            used_random_init=candidate.used_random_init,
             attempts=attempt,
             warnings=observation.warnings,
+            forward_mutations=candidate.forward_mutations,
         )
 
     diagnostic = last_failure or "no successful candidate/edit pair was produced"
@@ -278,7 +339,9 @@ def _sample_random_init(rng: random.Random, rho: float) -> bool:
 
 
 __all__ = [
+    "CurrentCandidateTrace",
     "TreeDiffusionTrainingExample",
     "generate_current_candidate",
+    "generate_current_candidate_with_trace",
     "generate_training_example",
 ]

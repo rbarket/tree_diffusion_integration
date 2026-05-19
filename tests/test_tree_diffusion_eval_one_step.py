@@ -98,6 +98,80 @@ class TreeDiffusionOneStepEvaluationTests(unittest.TestCase):
         self.assertEqual(summary.exact_target_rate, 1.0)
         self.assertEqual(summary.status_counts.get("ok"), 1)
 
+    def test_first_applicable_candidate_can_rescue_invalid_top_candidate(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        loader = DataLoader([_synthetic_known_edit_batch(tokenizer)], batch_size=None)
+        model = _invalid_then_correct_candidate_model(tokenizer)
+
+        summary = evaluate_one_step_edits(
+            model,  # type: ignore[arg-type]
+            loader,
+            tokenizer=tokenizer,
+            device="cpu",
+            num_batches=1,
+            max_decode_length=4,
+            compute_numeric_residual=False,
+            candidate_k=2,
+            use_first_applicable_candidate=True,
+        )
+
+        self.assertEqual(summary.examples, 1)
+        self.assertEqual(summary.decoded_ok_rate, 0.0)
+        self.assertEqual(summary.applicable_edit_rate, 1.0)
+        self.assertEqual(summary.exact_target_rate, 1.0)
+        self.assertEqual(summary.any_decoded_ok_rate, 1.0)
+        self.assertEqual(summary.any_applicable_edit_rate, 1.0)
+        self.assertEqual(summary.any_structural_improvement_rate, 1.0)
+        self.assertEqual(summary.first_applicable_rank_mean, 2.0)
+        self.assertEqual(summary.status_counts.get("replacement_parse_failed"), 1)
+
+    def test_candidate_mode_without_first_applicable_keeps_top_candidate_metrics(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        loader = DataLoader([_synthetic_known_edit_batch(tokenizer)], batch_size=None)
+        model = _invalid_then_correct_candidate_model(tokenizer)
+
+        summary = evaluate_one_step_edits(
+            model,  # type: ignore[arg-type]
+            loader,
+            tokenizer=tokenizer,
+            device="cpu",
+            num_batches=1,
+            max_decode_length=4,
+            compute_numeric_residual=False,
+            candidate_k=2,
+            use_first_applicable_candidate=False,
+        )
+
+        self.assertEqual(summary.examples, 1)
+        self.assertEqual(summary.decoded_ok_rate, 0.0)
+        self.assertEqual(summary.applicable_edit_rate, 0.0)
+        self.assertEqual(summary.exact_target_rate, 0.0)
+        self.assertEqual(summary.any_decoded_ok_rate, 1.0)
+        self.assertEqual(summary.any_applicable_edit_rate, 1.0)
+        self.assertEqual(summary.any_structural_improvement_rate, 1.0)
+        self.assertEqual(summary.first_applicable_rank_mean, 2.0)
+        self.assertEqual(summary.status_counts.get("replacement_parse_failed"), 1)
+
+    def test_validation_diagnostics_expose_candidate_metrics(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        loader = DataLoader([_synthetic_known_edit_batch(tokenizer)], batch_size=None)
+        model = _invalid_then_correct_candidate_model(tokenizer)
+
+        summary = run_one_step_edit_diagnostics(
+            model,  # type: ignore[arg-type]
+            loader,
+            tokenizer=tokenizer,
+            device="cpu",
+            num_batches=1,
+            candidate_k=2,
+            use_first_applicable_candidate=True,
+        )
+
+        self.assertEqual(summary.any_decoded_ok_rate, 1.0)
+        self.assertEqual(summary.any_applicable_edit_rate, 1.0)
+        self.assertEqual(summary.any_structural_improvement_rate, 1.0)
+        self.assertEqual(summary.first_applicable_rank_mean, 2.0)
+
     def test_numeric_residual_score_detects_improving_edit(self) -> None:
         target_integrand = parse_prefix_string("mul INT+ 3 pow x INT+ 2")
         current = parse_prefix_string("pow x INT+ 5")
@@ -295,6 +369,19 @@ def _correct_edit_model(tokenizer: TreeDiffusionTokenizer) -> _FixedLogitModel:
     return _FixedLogitModel(
         tokenizer,
         [{"<POS_2>": 10.0}, {"INT+": 10.0}, {"3": 10.0}, {"<eos>": 10.0}],
+        max_target_length=8,
+    )
+
+
+def _invalid_then_correct_candidate_model(tokenizer: TreeDiffusionTokenizer) -> _FixedLogitModel:
+    return _FixedLogitModel(
+        tokenizer,
+        [
+            {"<POS_2>": 10.0},
+            {"pow": 10.0, "INT+": 9.0},
+            {"3": 10.0},
+            {"<eos>": 10.0},
+        ],
         max_target_length=8,
     )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -10,7 +11,9 @@ from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.decoding import (
     DecodedEdit,
     apply_decoded_edit,
+    decode_edit_candidates,
     decode_edit_tokens,
+    first_applicable_decoded_edit,
     greedy_decode_edit_tokens,
     predict_greedy_edit,
     valid_position_token_ids,
@@ -90,6 +93,30 @@ class TreeDiffusionDecodingTests(unittest.TestCase):
 
         decoded = decode_edit_tokens(
             ["<POS_0>", "add", "x", "<eos>"],
+            tokenizer=tokenizer,
+            current_tree=current,
+        )
+
+        self.assertEqual(decoded.status, "replacement_parse_failed")
+
+    def test_decode_replacement_parse_failure_on_incomplete_operator(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        current = parse_prefix_string("x")
+
+        decoded = decode_edit_tokens(
+            ["<POS_0>", "pow", "x", "<eos>"],
+            tokenizer=tokenizer,
+            current_tree=current,
+        )
+
+        self.assertEqual(decoded.status, "replacement_parse_failed")
+
+    def test_decode_replacement_parse_failure_on_incomplete_integer(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        current = parse_prefix_string("x")
+
+        decoded = decode_edit_tokens(
+            ["<POS_0>", "INT+", "<eos>"],
             tokenizer=tokenizer,
             current_tree=current,
         )
@@ -233,6 +260,157 @@ class TreeDiffusionDecodingTests(unittest.TestCase):
         self.assertEqual(decoded.selected_node_id, 2)
         self.assertEqual(decoded.replacement_tokens, ["INT+", "3"])
         self.assertIsNotNone(decoded.logprob)
+
+    def test_decode_edit_candidates_returns_invalid_and_valid_candidates(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        current = parse_prefix_string("pow x INT+ 5")
+        model = _FixedLogitModel(
+            tokenizer,
+            [
+                {"<POS_2>": 10.0},
+                {"pow": 10.0, "INT+": 9.0},
+                {"3": 10.0},
+                {"<eos>": 10.0},
+            ],
+            max_target_length=8,
+        )
+
+        candidates = decode_edit_candidates(
+            model,  # type: ignore[arg-type]
+            _input_ids(tokenizer),
+            tokenizer=tokenizer,
+            current_tree=current,
+            k=2,
+            max_length=4,
+            constrain_position=True,
+        )
+
+        self.assertEqual([candidate.status for candidate in candidates], ["replacement_parse_failed", "ok"])
+        self.assertEqual(candidates[0].replacement_tokens, ["pow", "3"])
+        self.assertEqual(candidates[1].replacement_tokens, ["INT+", "3"])
+        self.assertIsNotNone(candidates[0].logprob)
+        self.assertIsNotNone(candidates[1].logprob)
+        assert candidates[0].logprob is not None and candidates[1].logprob is not None
+        self.assertGreater(candidates[0].logprob, candidates[1].logprob)
+
+    def test_decode_edit_candidates_constrains_first_token_to_current_positions(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        current = parse_prefix_string("pow x INT+ 5")
+        model = _FixedLogitModel(
+            tokenizer,
+            [{"x": 10.0, "<POS_2>": 5.0}, {"<eos>": 10.0}],
+            max_target_length=4,
+        )
+
+        candidates = decode_edit_candidates(
+            model,  # type: ignore[arg-type]
+            _input_ids(tokenizer),
+            tokenizer=tokenizer,
+            current_tree=current,
+            k=3,
+            max_length=2,
+            constrain_position=True,
+        )
+
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertTrue(candidate.generated_tokens[0].startswith("<POS_"))
+            self.assertIn(candidate.status, {"ok", "missing_replacement"})
+
+    def test_decode_edit_candidates_can_return_unconstrained_invalid_first_token(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        current = parse_prefix_string("pow x INT+ 5")
+        model = _FixedLogitModel(
+            tokenizer,
+            [{"x": 10.0, "<POS_2>": 5.0}, {"<eos>": 10.0}],
+            max_target_length=4,
+        )
+
+        candidates = decode_edit_candidates(
+            model,  # type: ignore[arg-type]
+            _input_ids(tokenizer),
+            tokenizer=tokenizer,
+            current_tree=current,
+            k=1,
+            max_length=2,
+            constrain_position=False,
+        )
+
+        self.assertEqual(candidates[0].generated_tokens[0], "x")
+        self.assertEqual(candidates[0].status, "invalid_position_token")
+
+    def test_decode_edit_candidates_rejects_nonpositive_k(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        current = parse_prefix_string("x")
+        model = _FixedLogitModel(tokenizer, [{"<POS_0>": 10.0}], max_target_length=2)
+
+        with self.assertRaisesRegex(ValueError, "k"):
+            decode_edit_candidates(
+                model,  # type: ignore[arg-type]
+                _input_ids(tokenizer),
+                tokenizer=tokenizer,
+                current_tree=current,
+                k=0,
+                max_length=1,
+            )
+
+    def test_first_applicable_decoded_edit_skips_invalid_candidate(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        current = parse_prefix_string("pow x INT+ 5")
+        invalid = decode_edit_tokens(
+            ["<POS_2>", "pow", "x", "<eos>"],
+            tokenizer=tokenizer,
+            current_tree=current,
+        )
+        valid = decode_edit_tokens(
+            ["<POS_2>", "INT+", "3", "<eos>"],
+            tokenizer=tokenizer,
+            current_tree=current,
+        )
+
+        selected, edited = first_applicable_decoded_edit(current, [invalid, valid])
+
+        self.assertIs(selected, valid)
+        self.assertIsNotNone(edited)
+        self.assertEqual(serialize_prefix_string(edited), "pow x INT+ 3")
+
+    def test_first_applicable_decoded_edit_skips_apply_failure(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        current = parse_prefix_string("pow x INT+ 5")
+        first = decode_edit_tokens(
+            ["<POS_2>", "INT+", "4", "<eos>"],
+            tokenizer=tokenizer,
+            current_tree=current,
+        )
+        second = decode_edit_tokens(
+            ["<POS_2>", "INT+", "3", "<eos>"],
+            tokenizer=tokenizer,
+            current_tree=current,
+        )
+
+        with patch(
+            "src.tree_diffusion.decoding.apply_subtree_replacement_by_position",
+            side_effect=[KeyError("forced"), parse_prefix_string("pow x INT+ 3")],
+        ):
+            selected, edited = first_applicable_decoded_edit(current, [first, second])
+
+        self.assertIs(selected, second)
+        self.assertIsNotNone(edited)
+        self.assertEqual(serialize_prefix_string(edited), "pow x INT+ 3")
+
+    def test_first_applicable_decoded_edit_returns_none_when_all_invalid(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        current = parse_prefix_string("x")
+        invalid = decode_edit_tokens(
+            ["<POS_0>", "pow", "x", "<eos>"],
+            tokenizer=tokenizer,
+            current_tree=current,
+        )
+
+        selected, edited = first_applicable_decoded_edit(current, [invalid])
+
+        self.assertIsNone(selected)
+        self.assertIsNone(edited)
 
 
 class _FixedLogitModel(torch.nn.Module):

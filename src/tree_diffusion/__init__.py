@@ -11,7 +11,9 @@ from src.tree_diffusion.dataset import (
 from src.tree_diffusion.decoding import (
     DecodedEdit,
     apply_decoded_edit,
+    decode_edit_candidates,
     decode_edit_tokens,
+    first_applicable_decoded_edit,
     greedy_decode_edit_tokens,
     predict_greedy_edit,
     valid_position_token_ids,
@@ -31,6 +33,10 @@ from src.tree_diffusion.eval_one_step import (
     OneStepEditEvaluationSummary,
     evaluate_one_step_edits,
     numeric_residual_score,
+)
+from src.tree_diffusion.evaluate_repair import (
+    RepairEvaluationSummary,
+    evaluate_greedy_repair,
 )
 from src.tree_diffusion.label_validation import (
     EditLabelValidationResult,
@@ -76,6 +82,16 @@ from src.tree_diffusion.precomputed_dataset import (
     load_precomputed_tokenizer_metadata,
 )
 from src.tree_diffusion.positions import NodePosition, PositionIndex, index_tree_positions
+from src.tree_diffusion.repair import (
+    RepairResult,
+    RepairScoringConfig,
+    RepairStep,
+    derivative_matches_target,
+    greedy_repair,
+    greedy_repair_from_seeds,
+    score_repair_candidate,
+    tree_size,
+)
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer, numeric_bucket_token
 from src.tree_diffusion.train_step import (
     TrainStepOutput,

@@ -26,7 +26,9 @@ from src.tree_diffusion.dataset import (
     make_tree_diffusion_dataloader,
 )
 from src.tree_diffusion.decoding import (
+    DecodedEdit,
     apply_decoded_edit,
+    decode_edit_candidates,
     predict_greedy_edit,
 )
 from src.tree_diffusion.edit_path import structural_distance
@@ -59,6 +61,17 @@ class OneStepEditEvaluationSummary:
     diagnostic_example_timeout_count: int = 0
     diagnostic_total_timeout_count: int = 0
     numeric_residual_timeout_count: int = 0
+    any_decoded_ok_rate: float | None = None
+    any_applicable_edit_rate: float | None = None
+    any_structural_improvement_rate: float | None = None
+    first_applicable_rank_mean: float | None = None
+
+
+@dataclass(frozen=True)
+class _CandidateApplication:
+    rank: int
+    candidate: DecodedEdit
+    edited_tree: Expr
 
 
 @torch.no_grad()
@@ -75,12 +88,17 @@ def evaluate_one_step_edits(
     diagnostic_timeout_seconds: float | None = None,
     diagnostic_example_timeout_seconds: float | None = None,
     numeric_residual_timeout_seconds: float | None = None,
+    candidate_k: int = 1,
+    use_first_applicable_candidate: bool = False,
 ) -> OneStepEditEvaluationSummary:
     if num_batches < 1:
         raise ValueError("num_batches must be >= 1.")
+    if candidate_k < 1:
+        raise ValueError("candidate_k must be >= 1.")
     _validate_optional_timeout("diagnostic_timeout_seconds", diagnostic_timeout_seconds)
     _validate_optional_timeout("diagnostic_example_timeout_seconds", diagnostic_example_timeout_seconds)
     _validate_optional_timeout("numeric_residual_timeout_seconds", numeric_residual_timeout_seconds)
+    candidate_mode = candidate_k > 1 or use_first_applicable_candidate
 
     target_device = torch.device(device)
     model.to(target_device)
@@ -101,6 +119,10 @@ def evaluate_one_step_edits(
     before_numeric_scores: list[float] = []
     after_numeric_scores: list[float] = []
     status_counts: Counter[str] = Counter()
+    any_decoded_ok = 0
+    any_applicable_edits = 0
+    any_structural_improvements = 0
+    first_applicable_ranks: list[float] = []
     diagnostic_example_timeout_count = 0
     diagnostic_total_timeout_count = 0
     numeric_residual_timeout_count = 0
@@ -157,6 +179,12 @@ def evaluate_one_step_edits(
                     diagnostic_example_timeout_count=diagnostic_example_timeout_count,
                     diagnostic_total_timeout_count=diagnostic_total_timeout_count,
                     numeric_residual_timeout_count=numeric_residual_timeout_count,
+                    any_decoded_ok=any_decoded_ok if candidate_mode else None,
+                    any_applicable_edits=any_applicable_edits if candidate_mode else None,
+                    any_structural_improvements=(
+                        any_structural_improvements if candidate_mode else None
+                    ),
+                    first_applicable_ranks=first_applicable_ranks if candidate_mode else None,
                 )
             examples += 1
             try:
@@ -189,39 +217,96 @@ def evaluate_one_step_edits(
                         status_counts["metadata_parse_failed"] += 1
                         continue
 
-                    decoded = predict_greedy_edit(
-                        model,
-                        _tensor_row(input_ids, row_index),
-                        tokenizer=tokenizer,
-                        current_tree=current_tree,
-                        input_attention_mask=(
-                            None
-                            if input_attention_mask is None
-                            else _tensor_row(input_attention_mask, row_index)
-                        ),
-                        max_length=max_decode_length,
-                        constrain_position=constrain_position,
-                        device=target_device,
+                    row_input_ids = _tensor_row(input_ids, row_index)
+                    row_attention_mask = (
+                        None
+                        if input_attention_mask is None
+                        else _tensor_row(input_attention_mask, row_index)
                     )
+                    if candidate_mode:
+                        candidates = decode_edit_candidates(
+                            model,
+                            row_input_ids,
+                            tokenizer=tokenizer,
+                            current_tree=current_tree,
+                            input_attention_mask=row_attention_mask,
+                            k=int(candidate_k),
+                            max_length=max_decode_length,
+                            constrain_position=constrain_position,
+                            device=target_device,
+                        )
+                        decoded = candidates[0]
+                    else:
+                        candidates = None
+                        decoded = predict_greedy_edit(
+                            model,
+                            row_input_ids,
+                            tokenizer=tokenizer,
+                            current_tree=current_tree,
+                            input_attention_mask=row_attention_mask,
+                            max_length=max_decode_length,
+                            constrain_position=constrain_position,
+                            device=target_device,
+                        )
 
                     if _has_valid_position(decoded_status=decoded.status):
                         valid_positions += 1
                     if decoded.status == "ok":
                         decoded_ok += 1
                         parseable_replacements += 1
-                    else:
+
+                    edited_tree: Expr | None = None
+                    if candidate_mode:
+                        assert candidates is not None
+                        applicable_candidates = _applicable_candidate_results(
+                            current_tree,
+                            candidates,
+                        )
+                        if any(candidate.status == "ok" for candidate in candidates):
+                            any_decoded_ok += 1
+                        if applicable_candidates:
+                            any_applicable_edits += 1
+                            first_applicable_ranks.append(float(applicable_candidates[0].rank))
+                            any_before = float(structural_distance(current_tree, target_tree))
+                            if any(
+                                float(structural_distance(result.edited_tree, target_tree))
+                                < any_before
+                                for result in applicable_candidates
+                            ):
+                                any_structural_improvements += 1
+
+                        top_application = _candidate_application_at_rank(
+                            applicable_candidates,
+                            1,
+                        )
+                        if decoded.status != "ok":
+                            status_counts[decoded.status] += 1
+                        elif top_application is None:
+                            status_counts["apply_failed"] += 1
+                        else:
+                            status_counts["ok"] += 1
+
+                        selected_application = (
+                            applicable_candidates[0]
+                            if use_first_applicable_candidate and applicable_candidates
+                            else top_application
+                        )
+                        if selected_application is None:
+                            continue
+                        edited_tree = selected_application.edited_tree
+                    elif decoded.status != "ok":
                         status_counts[decoded.status] += 1
                         continue
+                    else:
+                        try:
+                            edited_tree = apply_decoded_edit(current_tree, decoded)
+                        except Exception:
+                            status_counts["apply_failed"] += 1
+                            continue
+                        status_counts["ok"] += 1
 
-                    try:
-                        edited_tree = apply_decoded_edit(current_tree, decoded)
-                    except Exception:
-                        status_counts["apply_failed"] += 1
-                        continue
-
+                    assert edited_tree is not None
                     applicable_edits += 1
-                    status_counts["ok"] += 1
-
                     before = float(structural_distance(current_tree, target_tree))
                     after = float(structural_distance(edited_tree, target_tree))
                     before_distances.append(before)
@@ -279,6 +364,10 @@ def evaluate_one_step_edits(
         diagnostic_example_timeout_count=diagnostic_example_timeout_count,
         diagnostic_total_timeout_count=diagnostic_total_timeout_count,
         numeric_residual_timeout_count=numeric_residual_timeout_count,
+        any_decoded_ok=any_decoded_ok if candidate_mode else None,
+        any_applicable_edits=any_applicable_edits if candidate_mode else None,
+        any_structural_improvements=any_structural_improvements if candidate_mode else None,
+        first_applicable_ranks=first_applicable_ranks if candidate_mode else None,
     )
 
 
@@ -348,6 +437,10 @@ def _one_step_edit_summary(
     diagnostic_example_timeout_count: int,
     diagnostic_total_timeout_count: int,
     numeric_residual_timeout_count: int,
+    any_decoded_ok: int | None,
+    any_applicable_edits: int | None,
+    any_structural_improvements: int | None,
+    first_applicable_ranks: Sequence[float] | None,
 ) -> OneStepEditEvaluationSummary:
     return OneStepEditEvaluationSummary(
         examples=examples,
@@ -369,7 +462,53 @@ def _one_step_edit_summary(
         diagnostic_example_timeout_count=diagnostic_example_timeout_count,
         diagnostic_total_timeout_count=diagnostic_total_timeout_count,
         numeric_residual_timeout_count=numeric_residual_timeout_count,
+        any_decoded_ok_rate=(
+            None if any_decoded_ok is None else _rate(any_decoded_ok, examples)
+        ),
+        any_applicable_edit_rate=(
+            None if any_applicable_edits is None else _rate(any_applicable_edits, examples)
+        ),
+        any_structural_improvement_rate=(
+            None
+            if any_structural_improvements is None
+            else _rate(any_structural_improvements, examples)
+        ),
+        first_applicable_rank_mean=(
+            None if first_applicable_ranks is None else _mean_or_none(first_applicable_ranks)
+        ),
     )
+
+
+def _applicable_candidate_results(
+    current_tree: Expr,
+    candidates: Sequence[DecodedEdit],
+) -> list[_CandidateApplication]:
+    results: list[_CandidateApplication] = []
+    for rank, candidate in enumerate(candidates, start=1):
+        if candidate.status != "ok":
+            continue
+        try:
+            edited_tree = apply_decoded_edit(current_tree, candidate)
+        except Exception:
+            continue
+        results.append(
+            _CandidateApplication(
+                rank=rank,
+                candidate=candidate,
+                edited_tree=edited_tree,
+            )
+        )
+    return results
+
+
+def _candidate_application_at_rank(
+    applications: Sequence[_CandidateApplication],
+    rank: int,
+) -> _CandidateApplication | None:
+    for application in applications:
+        if application.rank == rank:
+            return application
+    return None
 
 
 def _effective_example_timeout(
@@ -395,6 +534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--checkpoint", default=None, help="Tree-diffusion checkpoint path.")
     parser.add_argument("--data", default=None, help="Parquet file containing integration pairs.")
     parser.add_argument("--precomputed-data-dir", default=None, help="Precomputed tree-diffusion data dir.")
+    parser.add_argument("--precomputed-split", choices=("train", "val"), default="val")
     parser.add_argument("--output", default=None, help="Optional summary JSON output path.")
     parser.add_argument("--num-pairs", type=int, default=128)
     parser.add_argument("--num-batches", type=int, default=5)
@@ -404,6 +544,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--constrain-position", dest="constrain_position", action="store_true", default=True)
     parser.add_argument("--no-constrain-position", dest="constrain_position", action="store_false")
     parser.add_argument("--max-decode-length", type=int, default=None)
+    parser.add_argument("--candidate-k", type=int, default=1)
+    parser.add_argument(
+        "--use-first-applicable-candidate",
+        action="store_true",
+        help="Use the first applicable top-k candidate for improvement metrics.",
+    )
     parser.add_argument(
         "--compute-numeric-residual",
         dest="compute_numeric_residual",
@@ -428,6 +574,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--num-batches must be >= 1.")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1.")
+    if args.candidate_k < 1:
+        raise ValueError("--candidate-k must be >= 1.")
 
     torch.manual_seed(int(args.seed))
     device = _resolve_device(str(args.device))
@@ -441,6 +589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     dataloader = _build_cli_dataloader(
         data=args.data,
         precomputed_data_dir=args.precomputed_data_dir,
+        precomputed_split=str(args.precomputed_split),
         tokenizer=tokenizer,
         model=model,
         num_pairs=int(args.num_pairs),
@@ -456,6 +605,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         constrain_position=bool(args.constrain_position),
         max_decode_length=args.max_decode_length,
         compute_numeric_residual=bool(args.compute_numeric_residual),
+        candidate_k=int(args.candidate_k),
+        use_first_applicable_candidate=bool(args.use_first_applicable_candidate),
     )
     summary_json = json_safe(asdict(summary))
     print(json.dumps(summary_json, indent=2, sort_keys=True))
@@ -503,6 +654,7 @@ def _build_cli_dataloader(
     *,
     data: str | None,
     precomputed_data_dir: str | None,
+    precomputed_split: str = "val",
     tokenizer: TreeDiffusionTokenizer,
     model: TreeDiffusionPolicyModel,
     num_pairs: int,
@@ -513,6 +665,7 @@ def _build_cli_dataloader(
         return make_tree_diffusion_dataloader(
             tokenizer=tokenizer,
             precomputed_data_dir=precomputed_data_dir,
+            precomputed_split=precomputed_split,
             precomputed_limit=num_pairs,
             batch_size=batch_size,
             shuffle_pairs=False,

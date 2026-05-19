@@ -166,6 +166,10 @@ def diagnostic_metrics(summary: Any) -> dict[str, float | int | None]:
         "diagnostic_example_timeout_count",
         "diagnostic_total_timeout_count",
         "numeric_residual_timeout_count",
+        "any_decoded_ok_rate",
+        "any_applicable_edit_rate",
+        "any_structural_improvement_rate",
+        "first_applicable_rank_mean",
     ):
         value = getattr(summary, name, None)
         if value is not None:

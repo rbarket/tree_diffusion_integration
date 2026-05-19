@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from typing import Sequence
 
 import torch
@@ -25,6 +26,13 @@ class DecodedEdit:
     status: str
     logprob: float | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class _TokenBeam:
+    token_ids: tuple[int, ...]
+    logprob: float
+    finished: bool
 
 
 def decode_edit_tokens(
@@ -128,6 +136,27 @@ def apply_decoded_edit(
     if canonicalize_result:
         return canonicalize(edited_tree)
     return edited_tree
+
+
+def first_applicable_decoded_edit(
+    current_tree: Expr,
+    candidates: Sequence[DecodedEdit],
+    *,
+    canonicalize_result: bool = True,
+) -> tuple[DecodedEdit | None, Expr | None]:
+    for candidate in candidates:
+        if candidate.status != "ok":
+            continue
+        try:
+            edited_tree = apply_decoded_edit(
+                current_tree,
+                candidate,
+                canonicalize_result=canonicalize_result,
+            )
+        except Exception:
+            continue
+        return candidate, edited_tree
+    return None, None
 
 
 def valid_position_token_ids(
@@ -239,6 +268,92 @@ def predict_greedy_edit(
     return replace(decoded, logprob=logprob)
 
 
+@torch.no_grad()
+def decode_edit_candidates(
+    model: TreeDiffusionPolicyModel,
+    input_ids: torch.Tensor,
+    *,
+    tokenizer: TreeDiffusionTokenizer,
+    current_tree: Expr,
+    input_attention_mask: torch.Tensor | None = None,
+    k: int = 8,
+    max_length: int | None = None,
+    constrain_position: bool = True,
+    device: torch.device | str | None = None,
+) -> list[DecodedEdit]:
+    if k <= 0:
+        raise ValueError("k must be > 0.")
+
+    input_ids = _single_example_ids("input_ids", input_ids)
+    if input_attention_mask is not None:
+        input_attention_mask = _single_example_ids("input_attention_mask", input_attention_mask)
+        if input_attention_mask.shape != input_ids.shape:
+            raise ValueError("input_attention_mask shape must match input_ids shape.")
+
+    if device is not None:
+        target_device = torch.device(device)
+        input_ids = input_ids.to(target_device)
+        if input_attention_mask is not None:
+            input_attention_mask = input_attention_mask.to(target_device)
+
+    decode_length = _resolve_decode_length(model, max_length)
+    memory, memory_padding_mask = model.encode(
+        input_ids,
+        input_attention_mask=input_attention_mask,
+    )
+    beams = [_TokenBeam(token_ids=(), logprob=0.0, finished=False)]
+    position_token_ids = (
+        valid_position_token_ids(current_tree, tokenizer) if constrain_position else None
+    )
+
+    for step in range(decode_length):
+        if all(beam.finished for beam in beams):
+            break
+
+        expanded: list[_TokenBeam] = []
+        for beam in beams:
+            if beam.finished:
+                expanded.append(beam)
+                continue
+
+            decoder_input_ids = input_ids.new_tensor([[tokenizer.bos_id, *beam.token_ids]])
+            target_attention_mask = torch.ones_like(decoder_input_ids)
+            hidden = model.decode(
+                decoder_input_ids,
+                memory=memory,
+                memory_padding_mask=memory_padding_mask,
+                target_attention_mask=target_attention_mask,
+            )
+            logits = model.lm_head(hidden)
+            next_logits = logits[:, -1, :]
+            if step == 0 and position_token_ids is not None:
+                next_logits = _mask_to_token_ids(next_logits, position_token_ids)
+
+            log_probs = F.log_softmax(next_logits, dim=-1)[0]
+            for token_logprob, token_id in _top_token_logprobs(log_probs, k):
+                expanded.append(
+                    _TokenBeam(
+                        token_ids=(*beam.token_ids, token_id),
+                        logprob=beam.logprob + token_logprob,
+                        finished=token_id == tokenizer.eos_id,
+                    )
+                )
+
+        if not expanded:
+            raise ValueError("No finite candidate token probabilities were available.")
+        beams = _prune_token_beams(expanded, k)
+
+    candidates: list[DecodedEdit] = []
+    for beam in beams:
+        decoded = decode_edit_tokens(
+            tokenizer.decode_ids(beam.token_ids),
+            tokenizer=tokenizer,
+            current_tree=current_tree,
+        )
+        candidates.append(replace(decoded, logprob=beam.logprob))
+    return candidates
+
+
 def _normalize_generated_tokens(
     tokens: Sequence[str],
     *,
@@ -333,10 +448,29 @@ def _mask_to_token_ids(logits: torch.Tensor, token_ids: Sequence[int]) -> torch.
     return masked
 
 
+def _top_token_logprobs(log_probs: torch.Tensor, k: int) -> list[tuple[float, int]]:
+    if log_probs.ndim != 1:
+        raise ValueError("log_probs must be a 1-D tensor.")
+    entries = [
+        (float(value), token_id)
+        for token_id, value in enumerate(log_probs.detach().cpu().tolist())
+        if math.isfinite(float(value))
+    ]
+    entries.sort(key=lambda item: (-item[0], item[1]))
+    return entries[:k]
+
+
+def _prune_token_beams(beams: Sequence[_TokenBeam], k: int) -> list[_TokenBeam]:
+    ordered = sorted(beams, key=lambda beam: (-beam.logprob, beam.token_ids))
+    return list(ordered[:k])
+
+
 __all__ = [
     "DecodedEdit",
     "apply_decoded_edit",
+    "decode_edit_candidates",
     "decode_edit_tokens",
+    "first_applicable_decoded_edit",
     "greedy_decode_edit_tokens",
     "predict_greedy_edit",
     "valid_position_token_ids",
