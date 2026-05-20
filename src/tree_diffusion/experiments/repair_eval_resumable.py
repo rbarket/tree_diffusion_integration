@@ -5,8 +5,6 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-import shutil
-import sys
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -19,25 +17,42 @@ from src.tree_diffusion._common import (
     resolve_device as _resolve_device,
     write_json as _write_json,
 )
-from src.tree_diffusion.dataset import (
-    load_integration_pairs_from_parquet,
-    make_tree_diffusion_dataloader,
-)
 from src.tree_diffusion.edit_path import structural_distance
-from src.tree_diffusion.eval_one_step import _load_cli_model_and_tokenizer
+from src.tree_diffusion.evaluation_common import (
+    batch_size as _batch_size,
+    metadata_item as _metadata_item,
+    mutation_trace_record as _mutation_trace_record,
+    repair_inputs_from_batch as _repair_inputs,
+    residual_executor_context as _residual_executor_context,
+)
+from src.tree_diffusion.eval_metrics import (
+    optional_bool_metadata as _optional_bool_metadata,
+    optional_int_metadata as _optional_int_metadata,
+)
 from src.tree_diffusion.evaluate_repair import (
     RepairEvaluationRecord,
-    _batch_size,
-    _metadata_item,
-    _mutation_trace_record,
-    _optional_bool_metadata,
-    _optional_int_metadata,
-    _repair_inputs,
-    _residual_executor_context,
     repair_evaluation_summary_to_json,
     summarize_repair_results,
 )
+from src.tree_diffusion.experiments.resumable import (
+    build_resumable_dataloader as _build_resumable_dataloader,
+    completed_example_count as _completed_example_count,
+    data_source_summary as _data_source_summary,
+    load_config as _load_config,
+    load_part_records as _load_generic_part_records,
+    merge_cli_config as _merge_cli_config,
+    next_part_index as _next_part_index,
+    prepare_output_dir as _prepare_output_dir,
+    progress as _progress,
+    run_config as _run_config,
+    target_example_count as _target_example_count,
+    write_manifest as _write_manifest,
+    write_part_records as _write_part,
+)
 from src.tree_diffusion.repair import RepairResult, RepairStep, greedy_repair
+from src.tree_diffusion.runtime import (
+    load_model_and_tokenizer_for_inference as _load_cli_model_and_tokenizer,
+)
 
 
 def run_resumable_greedy_repair_eval(
@@ -526,29 +541,12 @@ def _merged_cli_config(args: argparse.Namespace) -> dict[str, Any]:
         "max_examples_this_run": None,
         "compute_structural_metrics": True,
     }
-    values = dict(defaults)
-    if args.config is not None:
-        config_values = _load_json(Path(args.config))
-        unknown = set(config_values) - set(defaults)
-        if unknown:
-            raise ValueError(
-                "Unknown repair eval config field(s): " + ", ".join(sorted(unknown))
-            )
-        values.update(config_values)
-
-    for key in defaults:
-        value = getattr(args, key, None)
-        if value is not None:
-            values[key] = value
-
-    missing = [key for key in ("checkpoint", "output_dir") if values[key] is None]
-    if missing:
-        raise ValueError(
-            "Missing required repair eval setting(s): "
-            + ", ".join(missing)
-            + ". Provide them in --config or on the command line."
-        )
-    return values
+    return _merge_cli_config(
+        args,
+        defaults=defaults,
+        required=("checkpoint", "output_dir"),
+        label="repair eval",
+    )
 
 
 def _record_from_json(payload: Mapping[str, Any]) -> RepairEvaluationRecord:
@@ -567,215 +565,12 @@ def _record_from_json(payload: Mapping[str, Any]) -> RepairEvaluationRecord:
     )
 
 
-def _build_resumable_dataloader(
-    *,
-    data: str | None,
-    precomputed_data_dir: str | None,
-    precomputed_split: str,
-    tokenizer,
-    model,
-    num_pairs: int | None,
-    batch_size: int,
-    seed: int,
-):
-    if precomputed_data_dir is not None:
-        return make_tree_diffusion_dataloader(
-            tokenizer=tokenizer,
-            precomputed_data_dir=precomputed_data_dir,
-            precomputed_split=precomputed_split,
-            precomputed_limit=num_pairs,
-            batch_size=batch_size,
-            shuffle_pairs=False,
-            include_metadata=True,
-        )
-    assert data is not None
-    assert num_pairs is not None
-    pairs = load_integration_pairs_from_parquet(data, limit=num_pairs)
-    return make_tree_diffusion_dataloader(
-        pairs,
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-        num_workers=0,
-        max_input_length=model.config.max_input_length,
-        max_target_length=model.config.max_target_length,
-        base_seed=seed,
-        shuffle_pairs=False,
-        include_metadata=True,
-    )
-
-
-def _target_example_count(
-    *,
-    dataloader,
-    num_pairs: int | None,
-    num_batches: int | None,
-    batch_size: int,
-) -> int:
-    dataset = getattr(dataloader, "dataset", None)
-    dataset_len = None if dataset is None else int(len(dataset))
-    target = int(num_pairs) if num_pairs is not None else dataset_len
-    if target is None:
-        raise ValueError("Cannot infer target example count; provide --num-pairs.")
-    if num_batches is not None:
-        batch_limit = int(num_batches) * int(batch_size)
-        target = min(target, batch_limit)
-    if dataset_len is not None:
-        target = min(target, dataset_len)
-    return int(target)
-
-
-def _prepare_output_dir(
-    output_dir: Path,
-    *,
-    config: Mapping[str, Any],
-    resume: bool,
-    overwrite: bool,
-) -> None:
-    if resume and overwrite:
-        raise ValueError("--resume and --overwrite are mutually exclusive.")
-    if output_dir.exists() and overwrite:
-        shutil.rmtree(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    config_path = output_dir / "config.json"
-    if resume:
-        if not config_path.exists():
-            raise ValueError(f"Cannot resume: missing config.json in {output_dir}.")
-        prior = _load_json(config_path)
-        if prior != _json_safe(dict(config)):
-            completed_rows = _completed_example_count(output_dir / "parts")
-            if completed_rows == 0:
-                _write_json(config_path, dict(config))
-                return
-            if _resume_compatible_config(prior, config):
-                _write_json(config_path, dict(config))
-                return
-            raise ValueError("Cannot resume: current arguments do not match config.json.")
-        return
-    existing = [path for path in output_dir.iterdir() if path.name != "config.json"]
-    if existing:
-        raise ValueError(f"Output directory is not empty; use --resume or --overwrite: {output_dir}")
-    _write_json(config_path, dict(config))
-
-
-def _run_config(**values: Any) -> dict[str, Any]:
-    return _json_safe(dict(values))
-
-
-def _resume_compatible_config(
-    prior: Mapping[str, Any],
-    current: Mapping[str, Any],
-) -> bool:
-    allowed_to_change = {"progress_every", "flush_every", "part_size"}
-    prior_filtered = {
-        key: value for key, value in prior.items() if key not in allowed_to_change
-    }
-    current_filtered = {
-        key: value for key, value in current.items() if key not in allowed_to_change
-    }
-    return prior_filtered == _json_safe(current_filtered)
-
-
-def _data_source_summary(config: Mapping[str, Any]) -> dict[str, Any]:
-    if config.get("precomputed_data_dir") is not None:
-        return {
-            "kind": "precomputed",
-            "path": config.get("precomputed_data_dir"),
-            "split": config.get("precomputed_split"),
-        }
-    return {"kind": "parquet", "path": config.get("data")}
-
-
-def _write_part(parts_dir: Path, part_index: int, records: Sequence[Mapping[str, Any]]) -> None:
-    part_path = parts_dir / f"part_{part_index:06d}.jsonl"
-    tmp_path = part_path.with_suffix(part_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(_json_safe(dict(record)), sort_keys=True) + "\n")
-    tmp_path.replace(part_path)
-    part_summary = {
-        "part_index": int(part_index),
-        "path": str(part_path),
-        "examples": len(records),
-        "first_example_index": None if not records else records[0]["example_index"],
-        "last_example_index": None if not records else records[-1]["example_index"],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    _write_json(parts_dir / f"part_{part_index:06d}.summary.json", part_summary)
-
-
-def _write_manifest(
-    output_dir: Path,
-    *,
-    config: Mapping[str, Any],
-    target_examples: int,
-    completed_examples: int,
-    complete: bool,
-) -> None:
-    payload = {
-        "config": dict(config),
-        "target_examples": int(target_examples),
-        "completed_examples": int(completed_examples),
-        "complete": bool(complete),
-        "part_count": len(list((output_dir / "parts").glob("part_*.jsonl"))),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    _write_json(output_dir / "manifest.json", _json_safe(payload))
-
-
-def _progress(message: str, *, enabled: bool) -> None:
-    if enabled:
-        print(message, file=sys.stderr, flush=True)
-
-
-def _completed_example_count(parts_dir: Path) -> int:
-    return sum(_jsonl_line_count(path) for path in sorted(parts_dir.glob("part_*.jsonl")))
-
-
-def _next_part_index(parts_dir: Path) -> int:
-    indices: list[int] = []
-    for path in parts_dir.glob("part_*.jsonl"):
-        try:
-            indices.append(int(path.stem.removeprefix("part_")))
-        except ValueError:
-            continue
-    return 0 if not indices else max(indices) + 1
-
-
 def _load_part_records(parts_dir: Path) -> list[RepairEvaluationRecord]:
-    records: list[RepairEvaluationRecord] = []
-    expected_index = 0
-    for path in sorted(parts_dir.glob("part_*.jsonl")):
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                payload = json.loads(line)
-                example_index = int(payload.get("example_index", -1))
-                if example_index != expected_index:
-                    raise ValueError(
-                        f"Non-contiguous repair part index at {path}:{line_number}: "
-                        f"expected {expected_index}, got {example_index}."
-                    )
-                records.append(_record_from_json(payload))
-                expected_index += 1
-    return records
-
-
-def _jsonl_line_count(path: Path) -> int:
-    with path.open("r", encoding="utf-8") as handle:
-        return sum(1 for line in handle if line.strip())
-
-
-def _load_config(output_dir: Path) -> dict[str, Any]:
-    return _load_json(output_dir / "config.json")
-
-
-def _load_json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected JSON object in {path}.")
-    return payload
+    return _load_generic_part_records(
+        parts_dir,
+        record_from_json=_record_from_json,
+        label="repair",
+    )
 
 
 def _optional_float(value: Any) -> float | None:

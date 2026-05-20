@@ -1,27 +1,17 @@
+from __future__ import annotations
+
 from src.training.workflows.tree_diffusion import (
-    TreeDiffusionTrainingConfig,
     build_policy_model_for_config,
     load_checkpoint,
-    load_training_config,
-    main,
     make_loader_for_training_config,
     save_checkpoint,
     split_pairs_for_training,
-    train_tree_diffusion_policy,
 )
 
 __all__ = [
-    "TreeDiffusionTrainingConfig",
     "build_policy_model_for_config",
     "load_checkpoint",
-    "load_training_config",
-    "main",
     "make_loader_for_training_config",
     "save_checkpoint",
     "split_pairs_for_training",
-    "train_tree_diffusion_policy",
 ]
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

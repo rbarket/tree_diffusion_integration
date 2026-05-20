@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
@@ -21,10 +21,6 @@ from src.tree_diffusion._common import (
     resolve_device as _resolve_device,
     write_json as _write_json,
 )
-from src.tree_diffusion.dataset import (
-    load_integration_pairs_from_parquet,
-    make_tree_diffusion_dataloader,
-)
 from src.tree_diffusion.decoding import (
     DecodedEdit,
     apply_decoded_edit,
@@ -32,12 +28,24 @@ from src.tree_diffusion.decoding import (
     predict_greedy_edit,
 )
 from src.tree_diffusion.edit_path import structural_distance
-from src.tree_diffusion.model import TreeDiffusionModelConfig, TreeDiffusionPolicyModel
+from src.tree_diffusion.model import TreeDiffusionPolicyModel
 from src.tree_diffusion.observation import (
     ObservationTimeoutError,
     _observation_timeout,
     compute_current_derivative,
     compute_numeric_probes,
+)
+from src.tree_diffusion.runtime import (
+    batch_size as _runtime_batch_size,
+    build_evaluation_dataloader,
+    load_model_and_tokenizer_for_inference,
+    load_model_state,
+    model_config_from_checkpoint,
+    required_metadata,
+    required_tensor,
+    tensor_row,
+    tokenizer_from_checkpoint,
+    tokenizer_from_precomputed,
 )
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
@@ -630,33 +638,11 @@ def _load_cli_model_and_tokenizer(
     precomputed_data_dir: str | None,
     allow_random_init_model: bool,
 ) -> tuple[TreeDiffusionTokenizer, TreeDiffusionPolicyModel]:
-    if checkpoint is None:
-        assert allow_random_init_model
-        tokenizer = _tokenizer_from_precomputed(precomputed_data_dir) or TreeDiffusionTokenizer()
-        from src.training.workflows.tree_diffusion import (
-            TreeDiffusionTrainingConfig,
-            build_policy_model_for_config,
-        )
-
-        model = build_policy_model_for_config(TreeDiffusionTrainingConfig(), tokenizer)
-        return tokenizer, model
-
-    checkpoint_path = Path(checkpoint)
-    try:
-        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(checkpoint_path, map_location="cpu")
-    if not isinstance(payload, Mapping):
-        raise TypeError(f"Checkpoint must be a mapping, got {type(payload).__name__}.")
-
-    tokenizer = _tokenizer_from_checkpoint(payload) or _tokenizer_from_precomputed(precomputed_data_dir)
-    if tokenizer is None:
-        tokenizer = TreeDiffusionTokenizer()
-
-    model_config = _model_config_from_checkpoint(payload, tokenizer=tokenizer)
-    model = TreeDiffusionPolicyModel(model_config)
-    _load_model_state(model, payload, checkpoint_path=checkpoint_path)
-    return tokenizer, model
+    return load_model_and_tokenizer_for_inference(
+        checkpoint=checkpoint,
+        precomputed_data_dir=precomputed_data_dir,
+        allow_random_init_model=allow_random_init_model,
+    )
 
 
 def _build_cli_dataloader(
@@ -670,85 +656,32 @@ def _build_cli_dataloader(
     batch_size: int,
     seed: int,
 ):
-    if precomputed_data_dir is not None:
-        return make_tree_diffusion_dataloader(
-            tokenizer=tokenizer,
-            precomputed_data_dir=precomputed_data_dir,
-            precomputed_split=precomputed_split,
-            precomputed_limit=num_pairs,
-            batch_size=batch_size,
-            shuffle_pairs=False,
-            include_metadata=True,
-        )
-
-    assert data is not None
-    pairs = load_integration_pairs_from_parquet(data, limit=num_pairs)
-    return make_tree_diffusion_dataloader(
-        pairs,
+    return build_evaluation_dataloader(
+        data=data,
+        precomputed_data_dir=precomputed_data_dir,
+        precomputed_split=precomputed_split,
         tokenizer=tokenizer,
+        model=model,
+        num_pairs=num_pairs,
         batch_size=batch_size,
-        num_workers=0,
-        max_input_length=model.config.max_input_length,
-        max_target_length=model.config.max_target_length,
-        base_seed=seed,
-        shuffle_pairs=False,
-        include_metadata=True,
+        seed=seed,
     )
 
 
 def _tokenizer_from_checkpoint(payload: Mapping[str, Any]) -> TreeDiffusionTokenizer | None:
-    metadata = payload.get("tokenizer")
-    if not isinstance(metadata, Mapping):
-        return None
-    return TreeDiffusionTokenizer(
-        max_positions=int(metadata.get("max_positions", 512)),
-        numeric_log_min=int(metadata.get("numeric_log_min", -12)),
-        numeric_log_max=int(metadata.get("numeric_log_max", 12)),
-    )
+    return tokenizer_from_checkpoint(payload)
 
 
 def _tokenizer_from_precomputed(data_dir: str | None) -> TreeDiffusionTokenizer | None:
-    if data_dir is None:
-        return None
-    from src.tree_diffusion.precomputed_dataset import load_precomputed_tokenizer_metadata
-
-    metadata = load_precomputed_tokenizer_metadata(data_dir)
-    return TreeDiffusionTokenizer(
-        max_positions=int(metadata.get("max_positions", 512)),
-        numeric_log_min=int(metadata.get("numeric_log_min", -12)),
-        numeric_log_max=int(metadata.get("numeric_log_max", 12)),
-    )
+    return tokenizer_from_precomputed(data_dir)
 
 
 def _model_config_from_checkpoint(
     payload: Mapping[str, Any],
     *,
     tokenizer: TreeDiffusionTokenizer,
-) -> TreeDiffusionModelConfig:
-    raw_model_cfg = payload.get("model_cfg")
-    if isinstance(raw_model_cfg, Mapping):
-        allowed = {field.name for field in fields(TreeDiffusionModelConfig)}
-        values = {str(key): value for key, value in raw_model_cfg.items() if str(key) in allowed}
-        values["vocab_size"] = tokenizer.vocab_size
-        values["pad_token_id"] = tokenizer.pad_id
-        values["bos_token_id"] = tokenizer.bos_id
-        values["eos_token_id"] = tokenizer.eos_id
-        return TreeDiffusionModelConfig(**values)
-
-    raw_training_cfg = payload.get("config")
-    if isinstance(raw_training_cfg, Mapping):
-        from src.training.workflows.tree_diffusion import (
-            TreeDiffusionTrainingConfig,
-            build_policy_model_for_config,
-        )
-
-        model = build_policy_model_for_config(
-            TreeDiffusionTrainingConfig(**dict(raw_training_cfg)),
-            tokenizer,
-        )
-        return model.config
-
-    raise ValueError("Checkpoint does not contain model_cfg or training config metadata.")
+):
+    return model_config_from_checkpoint(payload, tokenizer=tokenizer)
 
 
 def _load_model_state(
@@ -757,62 +690,23 @@ def _load_model_state(
     *,
     checkpoint_path: Path,
 ) -> None:
-    if "state_dict" in payload and "model_state_dict" not in payload:
-        state_dict = payload["state_dict"]
-        if not isinstance(state_dict, Mapping):
-            raise TypeError(f"Lightning checkpoint state_dict must be a mapping: {checkpoint_path}")
-        model_state = {
-            str(key).removeprefix("model."): value
-            for key, value in state_dict.items()
-            if str(key).startswith("model.")
-        }
-        if not model_state:
-            raise KeyError(f"Lightning checkpoint missing model.* state_dict keys: {checkpoint_path}")
-        model.load_state_dict(model_state)
-        return
-
-    if "model_state_dict" not in payload:
-        raise KeyError(f"Checkpoint missing model_state_dict: {checkpoint_path}")
-    model.load_state_dict(payload["model_state_dict"])
+    load_model_state(model, payload, checkpoint_path=checkpoint_path)
 
 
 def _required_tensor(batch: Mapping[str, Any], key: str) -> torch.Tensor:
-    value = batch.get(key)
-    if not isinstance(value, torch.Tensor):
-        raise ValueError(f"Batch is missing required tensor field {key!r}.")
-    return value
+    return required_tensor(batch, key)
 
 
 def _required_metadata(batch: Mapping[str, Any], key: str, row_index: int) -> str:
-    if key not in batch:
-        raise ValueError(f"Batch is missing required metadata field {key!r}.")
-    value = batch[key]
-    if isinstance(value, (list, tuple)):
-        try:
-            item = value[row_index]
-        except IndexError as exc:
-            raise ValueError(f"Metadata field {key!r} is shorter than the tensor batch.") from exc
-    else:
-        item = value
-    if item is None:
-        raise ValueError(f"Metadata field {key!r} contains None.")
-    return str(item)
+    return str(required_metadata(batch, key, row_index))
 
 
 def _batch_size(input_ids: torch.Tensor) -> int:
-    if input_ids.ndim == 1:
-        return 1
-    if input_ids.ndim == 2:
-        return int(input_ids.size(0))
-    raise ValueError("input_ids must have shape (L,) or (B, L).")
+    return _runtime_batch_size(input_ids)
 
 
 def _tensor_row(value: torch.Tensor, row_index: int) -> torch.Tensor:
-    if value.ndim == 1:
-        if row_index != 0:
-            raise IndexError("Cannot index more than one row from a 1-D tensor.")
-        return value
-    return value[row_index]
+    return tensor_row(value, row_index)
 
 
 def _has_valid_position(*, decoded_status: str) -> bool:

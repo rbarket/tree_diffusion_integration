@@ -14,7 +14,6 @@ import shutil
 import subprocess
 from typing import Any, Iterator, Mapping, Sequence
 
-from src.mathlang.canonicalize import canonicalize
 from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion._common import (
     json_safe as _json_safe,
@@ -24,16 +23,23 @@ from src.tree_diffusion._common import (
     selected_node_summary as _selected_node_summary,
 )
 from src.tree_diffusion.dataset import IntegrationPair, load_integration_pairs_from_parquet
-from src.tree_diffusion.edit_path import EditTarget, first_edit_toward_target, structural_distance
-from src.tree_diffusion.label_validation import validate_edit_label_progress
+from src.tree_diffusion.precompute_config import (
+    TreeDiffusionPrecomputeConfig,
+    VALID_VAL_TRAJECTORY_MODES,
+    _RESUME_REQUIRED_CONFIG_FIELDS,
+    _config_dict,
+    load_precompute_config,
+    validate_precompute_config,
+)
+from src.tree_diffusion.precompute_records import (
+    PrecomputedTreeDiffusionExampleRecord,
+    precomputed_record_from_training_example,
+)
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 from src.tree_diffusion.training_examples import TreeDiffusionTrainingExample, generate_training_example
 
 
 PROGRESS_EVERY_EXAMPLES = 1_000
-VALID_PRECOMPUTE_SPLITS = frozenset({"train", "val"})
-VALID_VAL_TRAJECTORY_MODES = frozenset({"none", "forward_and_repair"})
-REPAIR_TRAJECTORY_MAX_STEPS = 64
 
 _RESUME_SHARD_COLUMNS = (
     "example_index_for_pair",
@@ -49,135 +55,8 @@ _RESUME_SHARD_COLUMNS = (
     "observation_status",
 )
 
-_RESUME_REQUIRED_CONFIG_FIELDS = (
-    "input_data",
-    "integrand_column",
-    "integral_column",
-    "train_limit",
-    "val_limit",
-    "val_fraction",
-    "seed",
-    "shuffle_before_limit",
-    "examples_per_pair_train",
-    "examples_per_pair_val",
-    "sigma_small",
-    "smax",
-    "rho",
-    "residual_mode",
-    "simplify_symbolic_residual",
-    "max_input_length",
-    "max_target_length",
-    "max_positions",
-    "max_random_size",
-    "max_attempts",
-    "observation_timeout_seconds",
-    "observation_timeout_retries",
-    "allow_complex_constants",
-    "allow_distributional_unary_ops",
-    "excluded_random_tokens",
-    "validate_labels",
-    "require_strict_label_improvement",
-)
-
-
 class ObservationTimeoutRetriesExhausted(RuntimeError):
     pass
-
-
-@dataclass
-class TreeDiffusionPrecomputeConfig:
-    input_data: str
-    output_dir: str = "data/precomputed/tree_diffusion"
-
-    integrand_column: str = "integrand_prefix"
-    integral_column: str = "integral_prefix"
-
-    train_limit: int | None = None
-    val_limit: int | None = 10000
-    val_fraction: float = 0.05
-    seed: int = 123
-    shuffle_before_limit: bool = True
-
-    examples_per_pair_train: int = 2
-    examples_per_pair_val: int = 2
-
-    shard_size: int = 50000
-    overwrite: bool = False
-    resume: bool = False
-
-    sigma_small: int = 2
-    smax: int = 5
-    rho: float = 0.2
-    residual_mode: str = "both"
-    simplify_symbolic_residual: bool = True
-
-    max_input_length: int = 1024
-    max_target_length: int = 128
-    max_positions: int = 512
-    max_random_size: int | None = None
-    max_attempts: int = 32
-    observation_timeout_seconds: float | None = 5.0
-    observation_timeout_retries: int = 3
-
-    allow_complex_constants: bool = False
-    allow_distributional_unary_ops: bool = False
-    excluded_random_tokens: tuple[str, ...] = ()
-
-    validate_labels: bool = True
-    require_strict_label_improvement: bool = False
-
-    max_failures: int | None = None
-    write_failed_examples: bool = True
-    failed_examples_limit: int = 100
-    num_workers: int = 1
-    splits: tuple[str, ...] = ("train", "val")
-    val_trajectory_mode: str = "none"
-
-    def __post_init__(self) -> None:
-        self.excluded_random_tokens = tuple(str(token) for token in self.excluded_random_tokens)
-        self.splits = _normalize_precompute_splits(self.splits)
-        validate_precompute_config(self)
-
-
-@dataclass(frozen=True)
-class PrecomputedTreeDiffusionExampleRecord:
-    split: str
-    global_example_index: int
-    pair_index: int | None
-    source: str | None
-    example_index_for_pair: int
-    rng_seed: int
-
-    target_integrand_prefix: str
-    target_antiderivative_prefix: str
-    current_antiderivative_prefix: str
-    current_derivative_prefix: str | None
-    symbolic_residual_prefix: str | None
-
-    input_tokens_json: str
-    target_tokens_json: str
-    input_ids_json: str
-    target_ids_json: str
-    labels_json: str
-    input_length: int
-    target_length: int
-
-    selected_node_id: int
-    replacement_subtree_prefix: str
-    resulting_tree_prefix: str | None
-
-    num_mutations: int
-    used_random_init: bool
-    sampled_s: int | None
-
-    distance_before: int | None
-    distance_after: int | None
-    label_validation_ok: bool
-    label_strict_improvement: bool
-
-    observation_status: str | None
-    warnings_json: str
-    trajectory_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -199,104 +78,6 @@ class _PrecomputeWorkerResult:
 
 _WORKER_CONFIG: TreeDiffusionPrecomputeConfig | None = None
 _WORKER_TOKENIZER: TreeDiffusionTokenizer | None = None
-
-
-def load_precompute_config(path: str | Path) -> TreeDiffusionPrecomputeConfig:
-    config_path = Path(path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Precompute config not found: {config_path}")
-    with config_path.open("r", encoding="utf-8") as handle:
-        raw = json.load(handle)
-    if not isinstance(raw, dict):
-        raise ValueError("Precompute config root must be a JSON object.")
-
-    known_fields = {field.name for field in fields(TreeDiffusionPrecomputeConfig)}
-    unknown = sorted(set(raw) - known_fields)
-    if unknown:
-        raise ValueError(f"Unknown precompute config field(s): {', '.join(unknown)}.")
-    if "excluded_random_tokens" in raw:
-        raw["excluded_random_tokens"] = tuple(raw["excluded_random_tokens"])
-    if "splits" in raw and not isinstance(raw["splits"], str):
-        raw["splits"] = tuple(raw["splits"])
-    return TreeDiffusionPrecomputeConfig(**raw)
-
-
-def _normalize_precompute_splits(value: Sequence[str] | str) -> tuple[str, ...]:
-    if isinstance(value, str):
-        raw_splits = value.split(",")
-    else:
-        raw_splits = list(value)
-
-    splits: list[str] = []
-    for raw_split in raw_splits:
-        split = str(raw_split).strip()
-        if not split:
-            continue
-        if split not in VALID_PRECOMPUTE_SPLITS:
-            raise ValueError("splits must contain only 'train' and/or 'val'.")
-        if split in splits:
-            raise ValueError("splits must not contain duplicates.")
-        splits.append(split)
-
-    if not splits:
-        raise ValueError("splits must include at least one of: train, val.")
-    return tuple(splits)
-
-
-def validate_precompute_config(config: TreeDiffusionPrecomputeConfig) -> None:
-    if not config.input_data:
-        raise ValueError("input_data is required.")
-    if not Path(config.input_data).exists():
-        raise ValueError(f"input_data does not exist: {config.input_data}")
-    if config.overwrite and config.resume:
-        raise ValueError("overwrite and resume are mutually exclusive.")
-    output_dir = Path(config.output_dir)
-    if config.resume and not output_dir.exists():
-        raise ValueError(f"Cannot resume because output_dir does not exist: {output_dir}")
-    if output_dir.exists() and not config.overwrite and not config.resume:
-        raise ValueError(f"output_dir already exists and overwrite=False: {output_dir}")
-    if config.train_limit is not None and config.train_limit < 1:
-        raise ValueError("train_limit must be >= 1 when provided.")
-    if config.val_limit is not None and config.val_limit < 0:
-        raise ValueError("val_limit must be >= 0 when provided.")
-    if not 0.0 <= config.val_fraction < 1.0:
-        raise ValueError("val_fraction must satisfy 0 <= val_fraction < 1.")
-    if config.examples_per_pair_train < 1:
-        raise ValueError("examples_per_pair_train must be >= 1.")
-    if config.examples_per_pair_val < 1:
-        raise ValueError("examples_per_pair_val must be >= 1.")
-    if config.shard_size < 1:
-        raise ValueError("shard_size must be >= 1.")
-    if config.sigma_small < 1:
-        raise ValueError("sigma_small must be >= 1.")
-    if config.smax < 1:
-        raise ValueError("smax must be >= 1.")
-    if not 0.0 <= config.rho <= 1.0:
-        raise ValueError("rho must satisfy 0 <= rho <= 1.")
-    if config.residual_mode not in {"none", "symbolic", "numeric", "both"}:
-        raise ValueError("residual_mode must be one of: none, symbolic, numeric, both.")
-    if config.max_input_length < 1:
-        raise ValueError("max_input_length must be >= 1.")
-    if config.max_target_length < 1:
-        raise ValueError("max_target_length must be >= 1.")
-    if config.max_positions < 1:
-        raise ValueError("max_positions must be >= 1.")
-    if config.max_random_size is not None and config.max_random_size < 0:
-        raise ValueError("max_random_size must be >= 0 when provided.")
-    if config.max_attempts < 1:
-        raise ValueError("max_attempts must be >= 1.")
-    if config.observation_timeout_seconds is not None and config.observation_timeout_seconds <= 0.0:
-        raise ValueError("observation_timeout_seconds must be > 0 when provided.")
-    if config.observation_timeout_retries < 0:
-        raise ValueError("observation_timeout_retries must be >= 0.")
-    if config.max_failures is not None and config.max_failures < 0:
-        raise ValueError("max_failures must be >= 0 when provided.")
-    if config.failed_examples_limit < 0:
-        raise ValueError("failed_examples_limit must be >= 0.")
-    if config.num_workers < 1:
-        raise ValueError("num_workers must be >= 1.")
-    if config.val_trajectory_mode not in VALID_VAL_TRAJECTORY_MODES:
-        raise ValueError("val_trajectory_mode must be one of: none, forward_and_repair.")
 
 
 def split_pairs_for_precompute(
@@ -351,243 +132,6 @@ def split_pairs_for_precompute(
         raise ValueError("No training pairs were available after split and limits.")
     _validate_no_pair_index_overlap(train_pairs, val_pairs)
     return train_pairs, val_pairs
-
-
-def precomputed_record_from_training_example(
-    example: TreeDiffusionTrainingExample,
-    *,
-    split: str,
-    global_example_index: int,
-    pair: IntegrationPair,
-    example_index_for_pair: int,
-    rng_seed: int,
-    tokenizer: TreeDiffusionTokenizer,
-    validate_labels: bool = True,
-    require_strict_label_improvement: bool = False,
-    trajectory_mode: str = "none",
-    repair_trajectory_rng_seed: int | None = None,
-    sigma_small: int = 2,
-) -> PrecomputedTreeDiffusionExampleRecord:
-    input_ids = example.input_ids
-    target_ids = example.target_ids
-    if input_ids is None:
-        input_ids = tokenizer.encode_tokens(example.input_tokens)
-    if target_ids is None:
-        target_ids = tokenizer.encode_tokens(example.target_tokens)
-    labels = [token_id if token_id != tokenizer.pad_id else -100 for token_id in target_ids]
-
-    distance_before: int | None = None
-    distance_after: int | None = None
-    label_validation_ok = True
-    label_strict_improvement = False
-    if validate_labels:
-        validation = validate_edit_label_progress(
-            example.current_antiderivative,
-            example.target_antiderivative,
-            example.edit_target,
-            require_strict_improvement=require_strict_label_improvement,
-        )
-        distance_before = validation.distance_before
-        distance_after = validation.distance_after
-        label_validation_ok = validation.ok
-        label_strict_improvement = validation.strict_improvement
-        if not validation.ok:
-            raise ValueError(
-                "label_validation_failed:"
-                f"{validation.error or 'unknown'}; split={split}; "
-                f"global_example_index={global_example_index}; pair_index={pair.index}; "
-                f"rng_seed={rng_seed}"
-            )
-    else:
-        try:
-            distance_before = structural_distance(
-                example.current_antiderivative,
-                example.target_antiderivative,
-            )
-            distance_after = structural_distance(
-                example.edit_target.resulting_tree,
-                example.target_antiderivative,
-            )
-            label_strict_improvement = distance_after < distance_before
-            label_validation_ok = distance_after <= distance_before
-        except Exception:
-            distance_before = None
-            distance_after = None
-            label_validation_ok = False
-            label_strict_improvement = False
-
-    trajectory_json = None
-    if split == "val" and trajectory_mode == "forward_and_repair":
-        trajectory_json = json.dumps(
-            _build_forward_and_repair_trajectory(
-                example,
-                pair=pair,
-                example_index_for_pair=example_index_for_pair,
-                rng_seed=rng_seed,
-                repair_rng_seed=repair_trajectory_rng_seed
-                if repair_trajectory_rng_seed is not None
-                else rng_seed + 31_000_031,
-                sigma_small=sigma_small,
-            ),
-            sort_keys=True,
-        )
-
-    return PrecomputedTreeDiffusionExampleRecord(
-        split=split,
-        global_example_index=global_example_index,
-        pair_index=pair.index,
-        source=pair.source,
-        example_index_for_pair=example_index_for_pair,
-        rng_seed=rng_seed,
-        target_integrand_prefix=serialize_prefix_string(example.target_integrand),
-        target_antiderivative_prefix=serialize_prefix_string(example.target_antiderivative),
-        current_antiderivative_prefix=serialize_prefix_string(example.current_antiderivative),
-        current_derivative_prefix=(
-            None
-            if example.observation.current_derivative is None
-            else serialize_prefix_string(example.observation.current_derivative)
-        ),
-        symbolic_residual_prefix=(
-            None
-            if example.observation.symbolic_residual is None
-            else serialize_prefix_string(example.observation.symbolic_residual)
-        ),
-        input_tokens_json=json.dumps(example.input_tokens),
-        target_tokens_json=json.dumps(example.target_tokens),
-        input_ids_json=json.dumps(list(input_ids)),
-        target_ids_json=json.dumps(list(target_ids)),
-        labels_json=json.dumps(labels),
-        input_length=len(example.input_tokens),
-        target_length=len(example.target_tokens),
-        selected_node_id=example.edit_target.selected_node_id,
-        replacement_subtree_prefix=serialize_prefix_string(example.edit_target.replacement_subtree),
-        resulting_tree_prefix=serialize_prefix_string(example.edit_target.resulting_tree),
-        num_mutations=example.num_mutations,
-        used_random_init=example.used_random_init,
-        sampled_s=None,
-        distance_before=distance_before,
-        distance_after=distance_after,
-        label_validation_ok=label_validation_ok,
-        label_strict_improvement=label_strict_improvement,
-        observation_status=example.observation.status,
-        warnings_json=json.dumps(list(example.warnings)),
-        trajectory_json=trajectory_json,
-    )
-
-
-def _build_forward_and_repair_trajectory(
-    example: TreeDiffusionTrainingExample,
-    *,
-    pair: IntegrationPair,
-    example_index_for_pair: int,
-    rng_seed: int,
-    repair_rng_seed: int,
-    sigma_small: int,
-) -> dict[str, Any]:
-    target_prefix = serialize_prefix_string(example.target_antiderivative)
-    current_prefix = serialize_prefix_string(example.current_antiderivative)
-    forward_steps: list[dict[str, Any]] = []
-    before = example.target_antiderivative
-    for step_index, mutation in enumerate(example.forward_mutations):
-        after = mutation.mutated_expr
-        forward_steps.append(
-            {
-                "step_index": step_index,
-                "before_prefix": serialize_prefix_string(before),
-                "after_prefix": serialize_prefix_string(after),
-                "selected_node_id": mutation.selected_node_id,
-                "selected_family": mutation.selected_family,
-                "mutation_kind": mutation.mutation_kind,
-                "original_subtree_prefix": serialize_prefix_string(mutation.original_subtree),
-                "replacement_subtree_prefix": serialize_prefix_string(mutation.replacement_subtree),
-                "selected_token_start": mutation.selected_token_start,
-                "selected_token_end": mutation.selected_token_end,
-            }
-        )
-        before = after
-
-    forward_complete = (
-        not example.used_random_init
-        and len(forward_steps) == example.num_mutations
-        and (not forward_steps or forward_steps[-1]["after_prefix"] == current_prefix)
-    )
-    repair_steps, repair_reached_target, repair_truncated = _build_repair_trajectory_steps(
-        example,
-        sigma_small=sigma_small,
-        repair_rng_seed=repair_rng_seed,
-    )
-    return {
-        "version": 1,
-        "mode": "forward_and_repair",
-        "rng_seed": rng_seed,
-        "repair_rng_seed": repair_rng_seed,
-        "pair_index": pair.index,
-        "source": pair.source,
-        "example_index_for_pair": example_index_for_pair,
-        "forward": {
-            "start_prefix": target_prefix,
-            "end_prefix": current_prefix,
-            "used_random_init": example.used_random_init,
-            "num_mutations": example.num_mutations,
-            "complete": forward_complete,
-            "steps": forward_steps,
-        },
-        "repair": {
-            "start_prefix": current_prefix,
-            "target_prefix": target_prefix,
-            "max_steps": REPAIR_TRAJECTORY_MAX_STEPS,
-            "reached_target": repair_reached_target,
-            "truncated": repair_truncated,
-            "steps": repair_steps,
-        },
-    }
-
-
-def _build_repair_trajectory_steps(
-    example: TreeDiffusionTrainingExample,
-    *,
-    sigma_small: int,
-    repair_rng_seed: int,
-) -> tuple[list[dict[str, Any]], bool, bool]:
-    target = canonicalize(example.target_antiderivative)
-    current = canonicalize(example.current_antiderivative)
-    if current == target:
-        return [], True, False
-
-    rng = random.Random(repair_rng_seed)
-    edit: EditTarget | None = example.edit_target
-    steps: list[dict[str, Any]] = []
-    for step_index in range(REPAIR_TRAJECTORY_MAX_STEPS):
-        if edit is None:
-            return steps, current == target, False
-        steps.append(_repair_step_record(step_index, current, target, edit))
-        current = canonicalize(edit.resulting_tree)
-        if current == target:
-            return steps, True, False
-        edit = first_edit_toward_target(current, target, sigma_small=sigma_small, rng=rng)
-
-    return steps, current == target, current != target
-
-
-def _repair_step_record(
-    step_index: int,
-    before_tree: Any,
-    target_tree: Any,
-    edit: EditTarget,
-) -> dict[str, Any]:
-    return {
-        "step_index": step_index,
-        "before_prefix": serialize_prefix_string(before_tree),
-        "after_prefix": serialize_prefix_string(edit.resulting_tree),
-        "selected_node_id": edit.selected_node_id,
-        "selected_node_span": list(edit.selected_node_span),
-        "mutation_kind": edit.mutation_kind,
-        "reason": edit.reason,
-        "original_subtree_prefix": serialize_prefix_string(edit.original_subtree),
-        "replacement_subtree_prefix": serialize_prefix_string(edit.replacement_subtree),
-        "distance_before": structural_distance(before_tree, target_tree),
-        "distance_after": structural_distance(edit.resulting_tree, target_tree),
-    }
 
 
 def _iter_precompute_tasks(
@@ -1653,10 +1197,6 @@ def _tokenizer_metadata(tokenizer: TreeDiffusionTokenizer) -> dict[str, Any]:
         "numeric_log_min": tokenizer.numeric_log_min,
         "numeric_log_max": tokenizer.numeric_log_max,
     }
-
-
-def _config_dict(config: TreeDiffusionPrecomputeConfig) -> dict[str, Any]:
-    return _json_safe(asdict(config))
 
 
 def _git_commit() -> str | None:

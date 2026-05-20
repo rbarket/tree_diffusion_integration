@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import json
-import math
-import multiprocessing as mp
 from pathlib import Path
-import statistics
-from typing import Any, ContextManager, Iterable, Literal, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 import torch
 
@@ -26,27 +21,35 @@ from src.tree_diffusion._common import (
     write_json as _write_json,
 )
 from src.tree_diffusion.edit_path import structural_distance
-from src.tree_diffusion.eval_one_step import (
-    _build_cli_dataloader,
-    _load_cli_model_and_tokenizer,
+from src.tree_diffusion.evaluation_common import (
+    batch_size as _batch_size,
+    metadata_item as _metadata_item,
+    mutation_trace_record as _mutation_trace_record,
+    repair_inputs_from_batch as _repair_inputs,
+    required_metadata as _required_metadata,
+    residual_executor_context as _residual_executor_context,
+)
+from src.tree_diffusion.eval_metrics import (
+    RepairGroupSummary,
+    is_finite as _is_finite,
+    median_or_none as _median_or_none,
+    meets_numeric_tol as _meets_numeric_tol,
+    num_mutations_group as _num_mutations_group,
+    numeric_values as _numeric_values,
+    optional_bool_metadata as _optional_bool_metadata,
+    optional_int_metadata as _optional_int_metadata,
+    repair_group_summary as _repair_group_summary,
+    residual_improvement_rate as _residual_improvement_rate,
+    summarize_repair_groups as _summarize_repair_groups,
+    used_random_init_group as _used_random_init_group,
 )
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
 from src.tree_diffusion.repair import RepairResult, greedy_repair
+from src.tree_diffusion.runtime import (
+    build_evaluation_dataloader as _build_cli_dataloader,
+    load_model_and_tokenizer_for_inference as _load_cli_model_and_tokenizer,
+)
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
-
-
-@dataclass(frozen=True)
-class RepairGroupSummary:
-    examples: int
-    success_rate: float
-    exact_symbolic_match_rate: float
-    numeric_success_rate: float
-    mean_steps_to_success: float | None
-    mean_initial_numeric_residual: float | None
-    mean_final_numeric_residual: float | None
-    numeric_residual_improvement_rate: float | None
-    structural_distance_improvement_rate: float | None
-    stop_reason_counts: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -571,17 +574,6 @@ def _dump_repair_examples(
     }
 
 
-def _residual_executor_context(
-    residual_workers: int,
-) -> ContextManager[ProcessPoolExecutor | None]:
-    if residual_workers <= 0:
-        return nullcontext(None)
-    # Use spawn so CPU-only SymPy workers do not inherit CUDA state from the
-    # main decoding process.
-    context = mp.get_context("spawn")
-    return ProcessPoolExecutor(max_workers=int(residual_workers), mp_context=context)
-
-
 def _repair_example_record(
     result: RepairResult,
     *,
@@ -612,14 +604,15 @@ def _group_by(
     key_fn,
     numeric_tol: float,
 ) -> dict[str, RepairGroupSummary]:
-    grouped: dict[str, list[RepairEvaluationRecord]] = {}
-    for record in records:
-        key = str(key_fn(record))
-        grouped.setdefault(key, []).append(record)
-    return {
-        key: _group_summary(group_records, numeric_tol=numeric_tol)
-        for key, group_records in sorted(grouped.items(), key=lambda item: item[0])
-    }
+    return _summarize_repair_groups(
+        records,
+        key_fn=key_fn,
+        result_fn=lambda row: row.result,
+        final_numeric_residual_fn=lambda result: result.final_numeric_residual,
+        structural_distance_initial_fn=lambda row: row.structural_distance_initial,
+        structural_distance_final_fn=lambda row: row.structural_distance_final,
+        numeric_tol=numeric_tol,
+    )
 
 
 def _group_summary(
@@ -627,37 +620,13 @@ def _group_summary(
     *,
     numeric_tol: float,
 ) -> RepairGroupSummary:
-    rows = list(records)
-    examples = len(rows)
-    results = [row.result for row in rows]
-    steps_to_success = [float(result.steps_taken) for result in results if result.success]
-    return RepairGroupSummary(
-        examples=examples,
-        success_rate=_rate(sum(int(result.success) for result in results), examples),
-        exact_symbolic_match_rate=_rate(
-            sum(int(result.exact_symbolic_match) for result in results),
-            examples,
-        ),
-        numeric_success_rate=_rate(
-            sum(int(_meets_numeric_tol(result.final_numeric_residual, numeric_tol)) for result in results),
-            examples,
-        ),
-        numeric_residual_improvement_rate=_residual_improvement_rate(
-            (result.initial_numeric_residual, result.final_numeric_residual)
-            for result in results
-        ),
-        mean_initial_numeric_residual=_mean_or_none(
-            _numeric_values(result.initial_numeric_residual for result in results)
-        ),
-        mean_final_numeric_residual=_mean_or_none(
-            _numeric_values(result.final_numeric_residual for result in results)
-        ),
-        mean_steps_to_success=_mean_or_none(steps_to_success),
-        structural_distance_improvement_rate=_residual_improvement_rate(
-            (row.structural_distance_initial, row.structural_distance_final)
-            for row in rows
-        ),
-        stop_reason_counts=dict(Counter(result.stop_reason for result in results)),
+    return _repair_group_summary(
+        records,
+        result_fn=lambda row: row.result,
+        final_numeric_residual_fn=lambda result: result.final_numeric_residual,
+        structural_distance_initial_fn=lambda row: row.structural_distance_initial,
+        structural_distance_final_fn=lambda row: row.structural_distance_final,
+        numeric_tol=numeric_tol,
     )
 
 
@@ -721,183 +690,6 @@ def _exact_match_step(result: RepairResult) -> int | None:
         if step.chosen_prefix is not None and step.exact_symbolic_match:
             return int(step.step_index) + 1
     return int(result.steps_taken)
-
-
-def _numeric_values(values: Iterable[float | None]) -> list[float]:
-    return [float(value) for value in values if value is not None and _is_finite(value)]
-
-
-def _residual_improvement_rate(
-    pairs: Iterable[tuple[float | None, float | None]],
-) -> float | None:
-    total = 0
-    improved = 0
-    for before, after in pairs:
-        if before is None or after is None:
-            continue
-        if not _is_finite(before) or not _is_finite(after):
-            continue
-        total += 1
-        improved += int(float(after) < float(before))
-    return None if total == 0 else improved / total
-
-
-def _meets_numeric_tol(value: float | None, numeric_tol: float) -> bool:
-    return value is not None and _is_finite(value) and float(value) <= numeric_tol
-
-
-def _is_finite(value: float | int) -> bool:
-    try:
-        return math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False
-
-
-def _used_random_init_group(value: bool | None) -> str:
-    if value is None:
-        return "unknown"
-    return "random_init" if bool(value) else "local_corruption"
-
-
-def _num_mutations_group(value: int | None) -> str:
-    if value is None:
-        return "unknown"
-    numeric_value = int(value)
-    if numeric_value > 5:
-        return "s>5"
-    return f"s={numeric_value}"
-
-
-def _optional_int_metadata(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _optional_bool_metadata(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "1", "yes", "y", "on"}:
-            return True
-        if lowered in {"false", "0", "no", "n", "off"}:
-            return False
-        return None
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return bool(value)
-
-
-def _repair_inputs(batch: Mapping[str, Any], row_index: int) -> tuple[Expr, Expr, Expr]:
-    current_prefix = _required_metadata(batch, "current_prefix", row_index)
-    target_integrand_prefix = _required_metadata(batch, "target_integrand_prefix", row_index)
-    target_antiderivative_prefix = _required_metadata(
-        batch,
-        "target_antiderivative_prefix",
-        row_index,
-    )
-    return (
-        canonicalize(
-            parse_prefix_string(target_integrand_prefix),
-            strip_additive_constants=False,
-        ),
-        canonicalize(parse_prefix_string(target_antiderivative_prefix)),
-        canonicalize(parse_prefix_string(current_prefix)),
-    )
-
-
-def _mutation_trace_record(batch: Mapping[str, Any], row_index: int) -> dict[str, Any] | None:
-    mode = _metadata_item(batch, "trajectory_mode", row_index, default=None)
-    trajectory = _metadata_item(batch, "trajectory", row_index, default=None)
-    if mode is None and trajectory is None:
-        return None
-    return {
-        "mode": mode,
-        "forward": {
-            "complete": _metadata_item(batch, "forward_complete", row_index, default=None),
-            "num_mutations": _metadata_item(batch, "forward_num_mutations", row_index, default=None),
-            "mutation_kinds": _metadata_item(batch, "forward_mutation_kinds", row_index, default=None),
-            "start_prefix": _metadata_item(batch, "forward_start_prefix", row_index, default=None),
-            "end_prefix": _metadata_item(batch, "forward_end_prefix", row_index, default=None),
-        },
-        "gold_repair_step": {
-            "step_index": _metadata_item(batch, "repair_step_index", row_index, default=None),
-            "mutation_kind": _metadata_item(batch, "repair_mutation_kind", row_index, default=None),
-            "reason": _metadata_item(batch, "repair_reason", row_index, default=None),
-            "selected_node_id": _metadata_item(batch, "repair_selected_node_id", row_index, default=None),
-            "selected_node_span": _metadata_item(batch, "repair_selected_node_span", row_index, default=None),
-            "original_subtree_prefix": _metadata_item(batch, "repair_original_subtree_prefix", row_index, default=None),
-            "replacement_subtree_prefix": _metadata_item(batch, "repair_replacement_subtree_prefix", row_index, default=None),
-            "distance_before": _metadata_item(batch, "repair_distance_before", row_index, default=None),
-            "distance_after": _metadata_item(batch, "repair_distance_after", row_index, default=None),
-        },
-        "repair_reached_target": _metadata_item(batch, "repair_reached_target", row_index, default=None),
-        "repair_step_count": _metadata_item(batch, "repair_step_count", row_index, default=None),
-    }
-
-
-def _metadata_item(
-    batch: Mapping[str, Any],
-    key: str,
-    row_index: int,
-    *,
-    default: Any = None,
-) -> Any:
-    if key not in batch:
-        return default
-    value = batch[key]
-    if isinstance(value, (list, tuple)):
-        try:
-            return value[row_index]
-        except IndexError:
-            return default
-    if isinstance(value, torch.Tensor):
-        if value.ndim == 0:
-            return value.item()
-        return value[row_index].detach().cpu().tolist()
-    return value
-
-
-def _batch_size(batch: Mapping[str, Any]) -> int:
-    for key in ("current_prefix", "target_integrand_prefix", "target_antiderivative_prefix"):
-        value = batch.get(key)
-        if isinstance(value, (list, tuple)):
-            return len(value)
-    input_ids = batch.get("input_ids")
-    if isinstance(input_ids, torch.Tensor):
-        if input_ids.ndim == 1:
-            return 1
-        if input_ids.ndim >= 2:
-            return int(input_ids.size(0))
-    return 1
-
-
-def _required_metadata(batch: Mapping[str, Any], key: str, row_index: int) -> str:
-    if key not in batch:
-        raise ValueError(f"Batch is missing required metadata field {key!r}.")
-    value = batch[key]
-    if isinstance(value, (list, tuple)):
-        try:
-            item = value[row_index]
-        except IndexError as exc:
-            raise ValueError(f"Metadata field {key!r} is shorter than the batch.") from exc
-    else:
-        item = value
-    if item is None:
-        raise ValueError(f"Metadata field {key!r} contains None.")
-    return str(item)
-
-
-def _median_or_none(values: Sequence[float]) -> float | None:
-    if not values:
-        return None
-    return float(statistics.median(values))
 
 
 def _validate_cli_args(args: argparse.Namespace) -> None:

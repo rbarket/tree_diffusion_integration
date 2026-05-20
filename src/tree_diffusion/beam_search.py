@@ -13,13 +13,23 @@ from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.decoding import apply_decoded_edit, decode_edit_candidates
-from src.tree_diffusion.edit_path import structural_distance
 from src.tree_diffusion.eval_one_step import numeric_residual_score
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
 from src.tree_diffusion.repair import (
     RepairStep,
+)
+from src.tree_diffusion.search_common import (
+    best_numeric_residual as _best_numeric_residual,
+    deadline_expired as _deadline_expired,
     derivative_matches_target,
     encode_repair_observation,
+    is_finite_numeric as _finite_numeric,
+    meets_numeric_tol as _meets_numeric_tol,
+    numeric_better as _numeric_better,
+    numeric_key as _numeric_key,
+    remaining_timeout as _remaining_timeout,
+    structural_better as _structural_better,
+    structural_distance_or_none as _structural_distance_or_none,
     tree_size,
 )
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
@@ -842,70 +852,6 @@ def _validate_stop_config(config: BeamSearchStopConfig) -> None:
         raise ValueError("max_expanded_states must be >= 1 or None.")
     if config.timeout_seconds is not None and config.timeout_seconds <= 0.0:
         raise ValueError("timeout_seconds must be > 0 or None.")
-
-
-def _remaining_timeout(timeout_seconds: float | None, *, deadline: float | None) -> float | None:
-    if deadline is None:
-        return timeout_seconds
-    remaining = deadline - time.monotonic()
-    if remaining <= 0.0:
-        raise TimeoutError("Beam search timeout expired.")
-    if timeout_seconds is None:
-        return remaining
-    return min(float(timeout_seconds), remaining)
-
-
-def _deadline_expired(deadline: float | None) -> bool:
-    return deadline is not None and time.monotonic() >= deadline
-
-
-def _structural_distance_or_none(expr: Expr, target_antiderivative: Expr | None) -> int | None:
-    if target_antiderivative is None:
-        return None
-    try:
-        return int(structural_distance(expr, target_antiderivative))
-    except Exception:
-        return None
-
-
-def _meets_numeric_tol(value: float | None, numeric_tol: float) -> bool:
-    return _finite_numeric(value) and float(value) <= float(numeric_tol)
-
-
-def _finite_numeric(value: float | None) -> bool:
-    try:
-        return value is not None and math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False
-
-
-def _numeric_key(value: float | None) -> float:
-    if not _finite_numeric(value):
-        return math.inf
-    assert value is not None
-    return float(value)
-
-
-def _best_numeric_residual(current_best: float | None, candidate_value: float | None) -> float | None:
-    if not _finite_numeric(candidate_value):
-        return current_best
-    if not _finite_numeric(current_best):
-        return float(candidate_value)  # type: ignore[arg-type]
-    assert current_best is not None
-    assert candidate_value is not None
-    return min(float(current_best), float(candidate_value))
-
-
-def _numeric_better(candidate: float | None, current: float | None) -> bool:
-    return _numeric_key(candidate) < _numeric_key(current)
-
-
-def _structural_better(candidate: int | None, current: int | None) -> bool:
-    if candidate is None:
-        return False
-    if current is None:
-        return True
-    return int(candidate) < int(current)
 
 
 def _path_best_numeric(state: BeamSearchState) -> float | None:

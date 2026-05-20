@@ -28,12 +28,14 @@ from src.tree_diffusion.beam_search import (
     BeamSearchStopConfig,
     beam_search_repair_from_seeds,
 )
-from src.tree_diffusion.eval_one_step import (
-    _load_cli_model_and_tokenizer,
-    numeric_residual_score,
+from src.tree_diffusion.evaluation_common import (
+    residual_executor_context as _residual_executor_context,
 )
-from src.tree_diffusion.evaluate_repair import _residual_executor_context
+from src.tree_diffusion.eval_one_step import numeric_residual_score
 from src.tree_diffusion.repair import derivative_matches_target
+from src.tree_diffusion.runtime import (
+    load_model_and_tokenizer_for_inference as _load_cli_model_and_tokenizer,
+)
 
 
 _VALID_SEED_SELECTIONS = {"all_parseable", "first_parseable", "best_numeric_seed"}

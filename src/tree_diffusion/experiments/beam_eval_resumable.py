@@ -20,34 +20,40 @@ from src.tree_diffusion.beam_search import (
     BeamSearchStopConfig,
     beam_search_repair,
 )
-from src.tree_diffusion.eval_one_step import _load_cli_model_and_tokenizer
 from src.tree_diffusion.evaluate_beam_search import (
     BeamRepairEvaluationRecord,
     beam_repair_evaluation_summary_to_json,
     summarize_beam_repair_results,
 )
-from src.tree_diffusion.evaluate_repair import (
-    _batch_size,
-    _metadata_item,
-    _optional_bool_metadata,
-    _optional_int_metadata,
-    _repair_inputs,
-    _residual_executor_context,
+from src.tree_diffusion.evaluation_common import (
+    batch_size as _batch_size,
+    metadata_item as _metadata_item,
+    repair_inputs_from_batch as _repair_inputs,
+    residual_executor_context as _residual_executor_context,
 )
-from src.tree_diffusion.experiments.repair_eval_resumable import (
-    _build_resumable_dataloader,
-    _completed_example_count,
-    _data_source_summary,
-    _jsonl_line_count,
-    _load_json,
-    _next_part_index,
-    _prepare_output_dir,
-    _progress,
-    _target_example_count,
-    _write_manifest,
-    _write_part,
+from src.tree_diffusion.eval_metrics import (
+    optional_bool_metadata as _optional_bool_metadata,
+    optional_int_metadata as _optional_int_metadata,
+)
+from src.tree_diffusion.experiments.resumable import (
+    build_resumable_dataloader as _build_resumable_dataloader,
+    completed_example_count as _completed_example_count,
+    data_source_summary as _data_source_summary,
+    load_json as _load_json,
+    load_part_records as _load_generic_part_records,
+    merge_cli_config as _merge_cli_config,
+    next_part_index as _next_part_index,
+    prepare_output_dir as _prepare_output_dir,
+    progress as _progress,
+    run_config as _run_config,
+    target_example_count as _target_example_count,
+    write_manifest as _write_manifest,
+    write_part_records as _write_part,
 )
 from src.tree_diffusion.repair import RepairStep
+from src.tree_diffusion.runtime import (
+    load_model_and_tokenizer_for_inference as _load_cli_model_and_tokenizer,
+)
 
 
 def run_resumable_beam_repair_eval(
@@ -547,23 +553,11 @@ def _record_from_json(payload: Mapping[str, Any]) -> BeamRepairEvaluationRecord:
 
 
 def _load_part_records(parts_dir: Path) -> list[BeamRepairEvaluationRecord]:
-    records: list[BeamRepairEvaluationRecord] = []
-    expected_index = 0
-    for path in sorted(parts_dir.glob("part_*.jsonl")):
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                payload = json.loads(line)
-                example_index = int(payload.get("example_index", -1))
-                if example_index != expected_index:
-                    raise ValueError(
-                        f"Non-contiguous beam part index at {path}:{line_number}: "
-                        f"expected {expected_index}, got {example_index}."
-                    )
-                records.append(_record_from_json(payload))
-                expected_index += 1
-    return records
+    return _load_generic_part_records(
+        parts_dir,
+        record_from_json=_record_from_json,
+        label="beam",
+    )
 
 
 def _merged_cli_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -603,29 +597,12 @@ def _merged_cli_config(args: argparse.Namespace) -> dict[str, Any]:
         "max_examples_this_run": None,
         "compute_structural_metrics": True,
     }
-    values = dict(defaults)
-    if args.config is not None:
-        config_values = _load_json(Path(args.config))
-        unknown = set(config_values) - set(defaults)
-        if unknown:
-            raise ValueError("Unknown beam eval config field(s): " + ", ".join(sorted(unknown)))
-        values.update(config_values)
-    for key in defaults:
-        value = getattr(args, key, None)
-        if value is not None:
-            values[key] = value
-    missing = [key for key in ("checkpoint", "output_dir") if values[key] is None]
-    if missing:
-        raise ValueError(
-            "Missing required beam eval setting(s): "
-            + ", ".join(missing)
-            + ". Provide them in --config or on the command line."
-        )
-    return values
-
-
-def _run_config(**values: Any) -> dict[str, Any]:
-    return _json_safe(dict(values))
+    return _merge_cli_config(
+        args,
+        defaults=defaults,
+        required=("checkpoint", "output_dir"),
+        label="beam eval",
+    )
 
 
 def _validate_args(**kwargs: Any) -> None:

@@ -32,9 +32,19 @@ from src.tree_diffusion.edit_path import structural_distance
 from src.tree_diffusion.eval_one_step import (
     evaluate_one_step_edits,
     numeric_residual_score,
-    _load_cli_model_and_tokenizer,
 )
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
+from src.tree_diffusion.evaluation_common import (
+    mutation_trace_record as _mutation_trace_record,
+)
+from src.tree_diffusion.runtime import (
+    batch_size as _batch_size,
+    load_model_and_tokenizer_for_inference as _load_cli_model_and_tokenizer,
+    metadata_item as _metadata_item,
+    required_metadata as _runtime_required_metadata,
+    required_tensor as _required_tensor,
+    tensor_row as _tensor_row,
+)
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
 
@@ -578,36 +588,6 @@ def _failure_type(
     return "no_applicable_candidate"
 
 
-def _mutation_trace_record(batch: Mapping[str, Any], row_index: int) -> dict[str, Any] | None:
-    mode = _metadata_item(batch, "trajectory_mode", row_index, default=None)
-    trajectory = _metadata_item(batch, "trajectory", row_index, default=None)
-    if mode is None and trajectory is None:
-        return None
-    return {
-        "mode": mode,
-        "forward": {
-            "complete": _metadata_item(batch, "forward_complete", row_index, default=None),
-            "num_mutations": _metadata_item(batch, "forward_num_mutations", row_index, default=None),
-            "mutation_kinds": _metadata_item(batch, "forward_mutation_kinds", row_index, default=None),
-            "start_prefix": _metadata_item(batch, "forward_start_prefix", row_index, default=None),
-            "end_prefix": _metadata_item(batch, "forward_end_prefix", row_index, default=None),
-        },
-        "gold_repair_step": {
-            "step_index": _metadata_item(batch, "repair_step_index", row_index, default=None),
-            "mutation_kind": _metadata_item(batch, "repair_mutation_kind", row_index, default=None),
-            "reason": _metadata_item(batch, "repair_reason", row_index, default=None),
-            "selected_node_id": _metadata_item(batch, "repair_selected_node_id", row_index, default=None),
-            "selected_node_span": _metadata_item(batch, "repair_selected_node_span", row_index, default=None),
-            "original_subtree_prefix": _metadata_item(batch, "repair_original_subtree_prefix", row_index, default=None),
-            "replacement_subtree_prefix": _metadata_item(batch, "repair_replacement_subtree_prefix", row_index, default=None),
-            "distance_before": _metadata_item(batch, "repair_distance_before", row_index, default=None),
-            "distance_after": _metadata_item(batch, "repair_distance_after", row_index, default=None),
-        },
-        "repair_reached_target": _metadata_item(batch, "repair_reached_target", row_index, default=None),
-        "repair_step_count": _metadata_item(batch, "repair_step_count", row_index, default=None),
-    }
-
-
 def _derived_comparison(
     metrics: Mapping[str, Any],
     *,
@@ -704,56 +684,8 @@ def _section_prefix(
     return " ".join(section)
 
 
-def _metadata_item(
-    batch: Mapping[str, Any],
-    key: str,
-    row_index: int,
-    *,
-    default: Any = None,
-) -> Any:
-    if key not in batch:
-        return default
-    value = batch[key]
-    if isinstance(value, (list, tuple)):
-        try:
-            return value[row_index]
-        except IndexError:
-            return default
-    if isinstance(value, torch.Tensor):
-        if value.ndim == 0:
-            return value.item()
-        return value[row_index].detach().cpu().tolist()
-    return value
-
-
 def _required_metadata(batch: Mapping[str, Any], key: str, row_index: int) -> str:
-    value = _metadata_item(batch, key, row_index)
-    if value is None:
-        raise ValueError(f"Batch is missing required metadata field {key!r}.")
-    return str(value)
-
-
-def _required_tensor(batch: Mapping[str, Any], key: str) -> torch.Tensor:
-    value = batch.get(key)
-    if not isinstance(value, torch.Tensor):
-        raise ValueError(f"Batch is missing required tensor field {key!r}.")
-    return value
-
-
-def _batch_size(input_ids: torch.Tensor) -> int:
-    if input_ids.ndim == 1:
-        return 1
-    if input_ids.ndim == 2:
-        return int(input_ids.size(0))
-    raise ValueError("input_ids must have shape (L,) or (B, L).")
-
-
-def _tensor_row(value: torch.Tensor, row_index: int) -> torch.Tensor:
-    if value.ndim == 1:
-        if row_index != 0:
-            raise IndexError("Cannot index more than one row from a 1-D tensor.")
-        return value
-    return value[row_index]
+    return str(_runtime_required_metadata(batch, key, row_index))
 
 
 __all__ = [

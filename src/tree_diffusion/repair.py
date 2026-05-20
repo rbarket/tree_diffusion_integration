@@ -5,22 +5,23 @@ from dataclasses import dataclass
 import math
 from typing import Literal, Sequence
 
-import sympy as sp
 import torch
 
 from src.mathlang.ast import Expr
 from src.mathlang.canonicalize import canonicalize
-from src.mathlang.conversions import ast_to_sympy
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.decoding import DecodedEdit, apply_decoded_edit, decode_edit_candidates
-from src.tree_diffusion.edit_path import structural_distance
 from src.tree_diffusion.eval_one_step import numeric_residual_score
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
-from src.tree_diffusion.observation import (
-    _observation_timeout,
-    build_observation,
-    compute_current_derivative,
+from src.tree_diffusion.search_common import (
+    best_numeric_residual as _best_numeric_residual,
+    derivative_matches_target,
+    encode_repair_observation,
+    is_finite_numeric as _finite_numeric,
+    meets_numeric_tol as _meets_numeric_tol,
+    structural_distance_or_none as _structural_distance_or_none,
+    tree_size,
 )
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
@@ -114,10 +115,6 @@ class _RepairCandidateScoreResult:
     exact_symbolic_match: bool
 
 
-def tree_size(expr: Expr) -> int:
-    return 1 + sum(tree_size(child) for child in expr.children())
-
-
 def score_repair_candidate(
     *,
     numeric_residual: float | None,
@@ -134,32 +131,6 @@ def score_repair_candidate(
     return residual_term + (float(config.lambda_size) * int(tree_size_value)) - (
         float(config.lambda_policy) * policy_term
     )
-
-
-def derivative_matches_target(
-    antiderivative: Expr,
-    target_integrand: Expr,
-    *,
-    simplify: bool = True,
-    timeout_seconds: float | None = None,
-) -> bool:
-    try:
-        with _observation_timeout(timeout_seconds):
-            derivative = compute_current_derivative(
-                antiderivative,
-                simplify_derivative=simplify,
-            )
-            if simplify:
-                residual = ast_to_sympy(derivative) - ast_to_sympy(
-                    canonicalize(target_integrand, strip_additive_constants=False)
-                )
-                return bool(sp.simplify(residual) == 0)
-            return canonicalize(derivative, strip_additive_constants=False) == canonicalize(
-                target_integrand,
-                strip_additive_constants=False,
-            )
-    except Exception:
-        return False
 
 
 @torch.no_grad()
@@ -605,32 +576,6 @@ def greedy_repair_from_seeds(
     return results[0]
 
 
-def encode_repair_observation(
-    target_integrand: Expr,
-    current_antiderivative: Expr,
-    *,
-    tokenizer: TreeDiffusionTokenizer,
-    residual_mode: str = "both",
-    simplify_symbolic_residual: bool = True,
-    observation_timeout_seconds: float | None = None,
-    max_input_length: int | None = None,
-) -> tuple[list[str], torch.LongTensor, torch.LongTensor]:
-    observation = build_observation(
-        target_integrand,
-        current_antiderivative,
-        residual_mode=residual_mode,
-        simplify_symbolic_residual=simplify_symbolic_residual,
-        observation_timeout_seconds=observation_timeout_seconds,
-    )
-    input_tokens = tokenizer.serialize_observation(observation) + ["<EDIT>"]
-    input_ids = torch.tensor(
-        tokenizer.encode_tokens(input_tokens, pad_to_length=max_input_length),
-        dtype=torch.long,
-    )
-    input_attention_mask = input_ids.ne(tokenizer.pad_id).to(dtype=torch.long)
-    return input_tokens, input_ids, input_attention_mask
-
-
 def _score_repair_candidates(
     candidates: Sequence[_RepairCandidateForScoring],
     *,
@@ -858,40 +803,10 @@ def _replacement_subtree_prefix(decoded: DecodedEdit) -> str | None:
     return serialize_prefix_string(decoded.replacement_subtree)
 
 
-def _structural_distance_or_none(
-    expr: Expr,
-    target_antiderivative: Expr | None,
-) -> int | None:
-    if target_antiderivative is None:
-        return None
-    return int(structural_distance(expr, target_antiderivative))
-
-
 def _numeric_improved(*, before: float | None, after: float | None) -> bool:
     if before is None or after is None:
         return False
     return float(after) < float(before)
-
-
-def _best_numeric_residual(
-    current_best: float | None,
-    candidate_value: float | None,
-) -> float | None:
-    if candidate_value is None:
-        return current_best
-    candidate = float(candidate_value)
-    if not math.isfinite(candidate):
-        return current_best
-    if current_best is None:
-        return candidate
-    best = float(current_best)
-    if not math.isfinite(best):
-        return candidate
-    return min(best, candidate)
-
-
-def _finite_numeric(value: float | None) -> bool:
-    return value is not None and math.isfinite(float(value))
 
 
 def _is_new_best_numeric(
@@ -919,10 +834,6 @@ def _select_repair_candidate(
     if selection_strategy == "residual_scored":
         return min(candidates, key=lambda item: (item.score, item.rank))
     raise ValueError("selection_strategy must be 'rank1' or 'residual_scored'.")
-
-
-def _meets_numeric_tol(value: float | None, numeric_tol: float) -> bool:
-    return value is not None and math.isfinite(float(value)) and float(value) <= numeric_tol
 
 
 __all__ = [

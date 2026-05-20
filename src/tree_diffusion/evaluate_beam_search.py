@@ -4,9 +4,7 @@ import argparse
 from collections import Counter
 from dataclasses import asdict, dataclass
 import json
-import math
 from pathlib import Path
-import statistics
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -27,23 +25,32 @@ from src.tree_diffusion.beam_search import (
     BeamSearchStopConfig,
     beam_search_repair,
 )
-from src.tree_diffusion.eval_one_step import (
-    _build_cli_dataloader,
-    _load_cli_model_and_tokenizer,
+from src.tree_diffusion.evaluation_common import (
+    batch_size as _batch_size,
+    metadata_item as _metadata_item,
+    mutation_trace_record as _mutation_trace_record,
+    repair_inputs_from_batch as _repair_inputs,
+    residual_executor_context as _residual_executor_context,
 )
-from src.tree_diffusion.evaluate_repair import (
+from src.tree_diffusion.eval_metrics import (
     RepairGroupSummary,
-    _batch_size,
-    _metadata_item,
-    _mutation_trace_record,
-    _num_mutations_group,
-    _optional_bool_metadata,
-    _optional_int_metadata,
-    _repair_inputs,
-    _residual_executor_context,
-    _used_random_init_group,
+    mean_or_zero as _mean_or_zero,
+    median_or_none as _median_or_none,
+    meets_numeric_tol as _meets_numeric_tol,
+    num_mutations_group as _num_mutations_group,
+    numeric_values as _numeric_values,
+    optional_bool_metadata as _optional_bool_metadata,
+    optional_int_metadata as _optional_int_metadata,
+    repair_group_summary as _repair_group_summary,
+    residual_improvement_rate as _residual_improvement_rate,
+    summarize_repair_groups as _summarize_repair_groups,
+    used_random_init_group as _used_random_init_group,
 )
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
+from src.tree_diffusion.runtime import (
+    build_evaluation_dataloader as _build_cli_dataloader,
+    load_model_and_tokenizer_for_inference as _load_cli_model_and_tokenizer,
+)
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
 
@@ -655,13 +662,15 @@ def _group_by(
     key_fn,
     numeric_tol: float,
 ) -> dict[str, RepairGroupSummary]:
-    grouped: dict[str, list[BeamRepairEvaluationRecord]] = {}
-    for record in records:
-        grouped.setdefault(str(key_fn(record)), []).append(record)
-    return {
-        key: _group_summary(group_records, numeric_tol=numeric_tol)
-        for key, group_records in sorted(grouped.items(), key=lambda item: item[0])
-    }
+    return _summarize_repair_groups(
+        records,
+        key_fn=key_fn,
+        result_fn=lambda row: row.result,
+        final_numeric_residual_fn=lambda result: result.best_numeric_residual,
+        structural_distance_initial_fn=lambda row: row.structural_distance_initial,
+        structural_distance_final_fn=lambda row: row.structural_distance_best,
+        numeric_tol=numeric_tol,
+    )
 
 
 def _group_summary(
@@ -669,37 +678,13 @@ def _group_summary(
     *,
     numeric_tol: float,
 ) -> RepairGroupSummary:
-    rows = list(records)
-    examples = len(rows)
-    results = [row.result for row in rows]
-    steps_to_success = [float(result.steps_taken) for result in results if result.success]
-    return RepairGroupSummary(
-        examples=examples,
-        success_rate=_rate(sum(int(result.success) for result in results), examples),
-        exact_symbolic_match_rate=_rate(
-            sum(int(result.exact_symbolic_match) for result in results),
-            examples,
-        ),
-        numeric_success_rate=_rate(
-            sum(int(_meets_numeric_tol(result.best_numeric_residual, numeric_tol)) for result in results),
-            examples,
-        ),
-        mean_steps_to_success=_mean_or_none(steps_to_success),
-        mean_initial_numeric_residual=_mean_or_none(
-            _numeric_values(result.initial_numeric_residual for result in results)
-        ),
-        mean_final_numeric_residual=_mean_or_none(
-            _numeric_values(result.best_numeric_residual for result in results)
-        ),
-        numeric_residual_improvement_rate=_residual_improvement_rate(
-            (result.initial_numeric_residual, result.best_numeric_residual)
-            for result in results
-        ),
-        structural_distance_improvement_rate=_residual_improvement_rate(
-            (row.structural_distance_initial, row.structural_distance_best)
-            for row in rows
-        ),
-        stop_reason_counts=dict(Counter(result.stop_reason for result in results)),
+    return _repair_group_summary(
+        records,
+        result_fn=lambda row: row.result,
+        final_numeric_residual_fn=lambda result: result.best_numeric_residual,
+        structural_distance_initial_fn=lambda row: row.structural_distance_initial,
+        structural_distance_final_fn=lambda row: row.structural_distance_best,
+        numeric_tol=numeric_tol,
     )
 
 
@@ -814,53 +799,10 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
         raise ValueError("--num-dump-examples must be >= 0.")
 
 
-def _numeric_values(values: Iterable[float | None]) -> list[float]:
-    return [float(value) for value in values if value is not None and _is_finite(value)]
-
-
-def _residual_improvement_rate(
-    pairs: Iterable[tuple[float | None, float | None]],
-) -> float | None:
-    total = 0
-    improved = 0
-    for before, after in pairs:
-        if before is None or after is None:
-            continue
-        if not _is_finite(before) or not _is_finite(after):
-            continue
-        total += 1
-        improved += int(float(after) < float(before))
-    return None if total == 0 else improved / total
-
-
-def _meets_numeric_tol(value: float | None, numeric_tol: float) -> bool:
-    return value is not None and _is_finite(value) and float(value) <= numeric_tol
-
-
-def _is_finite(value: float | int) -> bool:
-    try:
-        return math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False
-
-
 def _float_or_none(value: float | int | None) -> float | None:
     if value is None:
         return None
     return float(value)
-
-
-def _mean_or_zero(values: Iterable[float | int]) -> float:
-    rows = [float(value) for value in values]
-    if not rows:
-        return 0.0
-    return float(sum(rows) / len(rows))
-
-
-def _median_or_none(values: Sequence[float]) -> float | None:
-    if not values:
-        return None
-    return float(statistics.median(values))
 
 
 __all__ = [
