@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import Executor
 from dataclasses import dataclass
 import math
-from typing import Sequence
+from typing import Literal, Sequence
 
 import sympy as sp
 import torch
@@ -10,6 +11,7 @@ import torch
 from src.mathlang.ast import Expr
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.conversions import ast_to_sympy
+from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.decoding import DecodedEdit, apply_decoded_edit, decode_edit_candidates
 from src.tree_diffusion.edit_path import structural_distance
@@ -39,6 +41,7 @@ class RepairStep:
     policy_logprob: float | None
     numeric_residual_before: float | None
     numeric_residual_after: float | None
+    best_numeric_residual_so_far: float | None
     score: float | None
     structural_distance_before: int | None = None
     structural_distance_after: int | None = None
@@ -56,6 +59,9 @@ class RepairResult:
     steps_taken: int
     initial_numeric_residual: float | None
     final_numeric_residual: float | None
+    best_numeric_residual: float | None
+    best_prefix: str | None
+    best_step_index: int | None
     exact_symbolic_match: bool
     repeated_state: bool
     no_candidate: bool
@@ -75,6 +81,33 @@ class _ScoredRepairCandidate:
     decoded: DecodedEdit
     edited_tree: Expr
     edited_prefix: str
+    numeric_residual_after: float | None
+    score: float
+    structural_distance_after: int | None
+    exact_symbolic_match: bool
+
+
+@dataclass(frozen=True)
+class _RepairCandidateForScoring:
+    rank: int
+    decoded: DecodedEdit
+    edited_tree: Expr
+    edited_prefix: str
+
+
+@dataclass(frozen=True)
+class _RepairCandidateScoreRequest:
+    edited_prefix: str
+    target_integrand_prefix: str
+    target_antiderivative_prefix: str | None
+    policy_logprob: float | None
+    scoring: RepairScoringConfig
+    numeric_residual_timeout_seconds: float | None
+    symbolic_check_timeout_seconds: float | None
+
+
+@dataclass(frozen=True)
+class _RepairCandidateScoreResult:
     numeric_residual_after: float | None
     score: float
     structural_distance_after: int | None
@@ -146,9 +179,12 @@ def greedy_repair(
     scoring: RepairScoringConfig | None = None,
     residual_mode: str = "both",
     simplify_symbolic_residual: bool = True,
+    observation_timeout_seconds: float | None = 2.0,
     numeric_residual_timeout_seconds: float | None = 2.0,
     symbolic_check_timeout_seconds: float | None = 2.0,
     target_antiderivative: Expr | None = None,
+    selection_strategy: Literal["rank1", "residual_scored"] = "residual_scored",
+    residual_executor: Executor | None = None,
 ) -> RepairResult:
     if max_steps < 0:
         raise ValueError("max_steps must be >= 0.")
@@ -158,6 +194,8 @@ def greedy_repair(
         raise ValueError("numeric_tol must be >= 0.")
     if patience < 0:
         raise ValueError("patience must be >= 0.")
+    if selection_strategy not in {"rank1", "residual_scored"}:
+        raise ValueError("selection_strategy must be 'rank1' or 'residual_scored'.")
 
     config = scoring or RepairScoringConfig()
     target_device = torch.device(device)
@@ -180,6 +218,9 @@ def greedy_repair(
         timeout_seconds=numeric_residual_timeout_seconds,
     )
     initial_numeric = current_numeric
+    best_numeric = current_numeric
+    best_prefix = initial_prefix if _finite_numeric(current_numeric) else None
+    best_step_index = 0 if _finite_numeric(current_numeric) else None
     exact_match = derivative_matches_target(
         current,
         canonical_target_integrand,
@@ -196,6 +237,9 @@ def greedy_repair(
             steps=steps,
             initial_numeric_residual=initial_numeric,
             final_numeric_residual=current_numeric,
+            best_numeric_residual=best_numeric,
+            best_prefix=best_prefix,
+            best_step_index=best_step_index,
             exact_symbolic_match=True,
         )
     if _meets_numeric_tol(current_numeric, numeric_tol):
@@ -207,6 +251,9 @@ def greedy_repair(
             steps=steps,
             initial_numeric_residual=initial_numeric,
             final_numeric_residual=current_numeric,
+            best_numeric_residual=best_numeric,
+            best_prefix=best_prefix,
+            best_step_index=best_step_index,
             exact_symbolic_match=False,
         )
     if max_steps == 0:
@@ -218,6 +265,9 @@ def greedy_repair(
             steps=steps,
             initial_numeric_residual=initial_numeric,
             final_numeric_residual=current_numeric,
+            best_numeric_residual=best_numeric,
+            best_prefix=best_prefix,
+            best_step_index=best_step_index,
             exact_symbolic_match=False,
         )
 
@@ -232,15 +282,17 @@ def greedy_repair(
         )
 
         try:
-            input_ids, input_attention_mask = _encode_repair_observation(
-                model=model,
+            _, input_ids, input_attention_mask = encode_repair_observation(
                 tokenizer=tokenizer,
                 target_integrand=canonical_target_integrand,
                 current_antiderivative=current,
                 residual_mode=residual_mode,
                 simplify_symbolic_residual=simplify_symbolic_residual,
-                device=target_device,
+                observation_timeout_seconds=observation_timeout_seconds,
+                max_input_length=getattr(getattr(model, "config", None), "max_input_length", None),
             )
+            input_ids = input_ids.to(target_device)
+            input_attention_mask = input_attention_mask.to(target_device)
         except Exception:
             steps.append(
                 RepairStep(
@@ -255,6 +307,7 @@ def greedy_repair(
                     policy_logprob=None,
                     numeric_residual_before=current_numeric,
                     numeric_residual_after=None,
+                    best_numeric_residual_so_far=best_numeric,
                     score=None,
                     structural_distance_before=structural_before,
                     structural_distance_after=None,
@@ -269,6 +322,9 @@ def greedy_repair(
                 steps=steps,
                 initial_numeric_residual=initial_numeric,
                 final_numeric_residual=current_numeric,
+                best_numeric_residual=best_numeric,
+                best_prefix=best_prefix,
+                best_step_index=best_step_index,
                 exact_symbolic_match=False,
             )
 
@@ -298,6 +354,7 @@ def greedy_repair(
                     policy_logprob=None,
                     numeric_residual_before=current_numeric,
                     numeric_residual_after=None,
+                    best_numeric_residual_so_far=best_numeric,
                     score=None,
                     structural_distance_before=structural_before,
                     structural_distance_after=None,
@@ -312,10 +369,13 @@ def greedy_repair(
                 steps=steps,
                 initial_numeric_residual=initial_numeric,
                 final_numeric_residual=current_numeric,
+                best_numeric_residual=best_numeric,
+                best_prefix=best_prefix,
+                best_step_index=best_step_index,
                 exact_symbolic_match=False,
             )
 
-        scored_candidates: list[_ScoredRepairCandidate] = []
+        score_inputs: list[_RepairCandidateForScoring] = []
         applicable_candidates = 0
         non_repeated_candidates = 0
         for rank, candidate in enumerate(candidates, start=1):
@@ -332,41 +392,26 @@ def greedy_repair(
                 continue
             non_repeated_candidates += 1
 
-            numeric_after = numeric_residual_score(
-                edited_tree,
-                canonical_target_integrand,
-                timeout_seconds=numeric_residual_timeout_seconds,
-            )
-            if config.require_numeric_improvement and not _numeric_improved(
-                before=current_numeric,
-                after=numeric_after,
-            ):
-                continue
-
-            scored_candidates.append(
-                _ScoredRepairCandidate(
+            score_inputs.append(
+                _RepairCandidateForScoring(
                     rank=rank,
                     decoded=candidate,
                     edited_tree=edited_tree,
                     edited_prefix=edited_prefix,
-                    numeric_residual_after=numeric_after,
-                    score=score_repair_candidate(
-                        numeric_residual=numeric_after,
-                        tree_size_value=tree_size(edited_tree),
-                        policy_logprob=candidate.logprob,
-                        config=config,
-                    ),
-                    structural_distance_after=_structural_distance_or_none(
-                        edited_tree,
-                        canonical_target_antiderivative,
-                    ),
-                    exact_symbolic_match=derivative_matches_target(
-                        edited_tree,
-                        canonical_target_integrand,
-                        timeout_seconds=symbolic_check_timeout_seconds,
-                    ),
                 )
             )
+
+        scored_candidates = _score_repair_candidates(
+            score_inputs,
+            target_integrand=canonical_target_integrand,
+            target_integrand_prefix=target_integrand_prefix,
+            target_antiderivative=canonical_target_antiderivative,
+            config=config,
+            current_numeric=current_numeric,
+            numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
+            symbolic_check_timeout_seconds=symbolic_check_timeout_seconds,
+            residual_executor=residual_executor,
+        )
 
         if not scored_candidates:
             if applicable_candidates == 0:
@@ -382,6 +427,7 @@ def greedy_repair(
                     current_prefix=current_prefix,
                     decoded=top_candidate,
                     numeric_residual_before=current_numeric,
+                    best_numeric_residual=best_numeric,
                     structural_distance_before=structural_before,
                     stop_reason=stop_reason,
                 )
@@ -394,10 +440,16 @@ def greedy_repair(
                 steps=steps,
                 initial_numeric_residual=initial_numeric,
                 final_numeric_residual=current_numeric,
+                best_numeric_residual=best_numeric,
+                best_prefix=best_prefix,
+                best_step_index=best_step_index,
                 exact_symbolic_match=False,
             )
 
-        chosen = min(scored_candidates, key=lambda item: (item.score, item.rank))
+        chosen = _select_repair_candidate(
+            scored_candidates,
+            selection_strategy=selection_strategy,
+        )
         improved = _numeric_improved(
             before=current_numeric,
             after=chosen.numeric_residual_after,
@@ -415,6 +467,15 @@ def greedy_repair(
         elif non_improving_steps >= patience:
             next_stop_reason = "no_numeric_improvement"
 
+        next_best_numeric = _best_numeric_residual(
+            best_numeric,
+            chosen.numeric_residual_after,
+        )
+        next_best_prefix = best_prefix
+        next_best_step_index = best_step_index
+        if _is_new_best_numeric(best_numeric, chosen.numeric_residual_after):
+            next_best_prefix = chosen.edited_prefix
+            next_best_step_index = step_index + 1
         steps.append(
             RepairStep(
                 step_index=step_index,
@@ -428,6 +489,7 @@ def greedy_repair(
                 policy_logprob=chosen.decoded.logprob,
                 numeric_residual_before=current_numeric,
                 numeric_residual_after=chosen.numeric_residual_after,
+                best_numeric_residual_so_far=next_best_numeric,
                 score=chosen.score,
                 structural_distance_before=structural_before,
                 structural_distance_after=chosen.structural_distance_after,
@@ -438,6 +500,9 @@ def greedy_repair(
 
         current = chosen.edited_tree
         current_numeric = chosen.numeric_residual_after
+        best_numeric = next_best_numeric
+        best_prefix = next_best_prefix
+        best_step_index = next_best_step_index
         visited_prefixes.add(chosen.edited_prefix)
 
         if next_stop_reason is not None:
@@ -449,6 +514,9 @@ def greedy_repair(
                 steps=steps,
                 initial_numeric_residual=initial_numeric,
                 final_numeric_residual=current_numeric,
+                best_numeric_residual=best_numeric,
+                best_prefix=best_prefix,
+                best_step_index=best_step_index,
                 exact_symbolic_match=chosen.exact_symbolic_match,
             )
 
@@ -460,6 +528,9 @@ def greedy_repair(
         steps=steps,
         initial_numeric_residual=initial_numeric,
         final_numeric_residual=current_numeric,
+        best_numeric_residual=best_numeric,
+        best_prefix=best_prefix,
+        best_step_index=best_step_index,
         exact_symbolic_match=derivative_matches_target(
             current,
             canonical_target_integrand,
@@ -479,13 +550,18 @@ def greedy_repair_from_seeds(
     max_steps: int = 10,
     candidate_k: int = 8,
     numeric_tol: float = 1e-10,
+    patience: int = 2,
+    constrain_position: bool = True,
     max_decode_length: int | None = None,
     scoring: RepairScoringConfig | None = None,
     residual_mode: str = "both",
     simplify_symbolic_residual: bool = True,
+    observation_timeout_seconds: float | None = 2.0,
     numeric_residual_timeout_seconds: float | None = 2.0,
     symbolic_check_timeout_seconds: float | None = 2.0,
     target_antiderivative: Expr | None = None,
+    selection_strategy: Literal["rank1", "residual_scored"] = "residual_scored",
+    residual_executor: Executor | None = None,
 ) -> RepairResult:
     if not seeds:
         raise ValueError("seeds must be non-empty.")
@@ -501,13 +577,18 @@ def greedy_repair_from_seeds(
             max_steps=max_steps,
             candidate_k=candidate_k,
             numeric_tol=numeric_tol,
+            patience=patience,
+            constrain_position=constrain_position,
             max_decode_length=max_decode_length,
             scoring=scoring,
             residual_mode=residual_mode,
             simplify_symbolic_residual=simplify_symbolic_residual,
+            observation_timeout_seconds=observation_timeout_seconds,
             numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
             symbolic_check_timeout_seconds=symbolic_check_timeout_seconds,
             target_antiderivative=target_antiderivative,
+            selection_strategy=selection_strategy,
+            residual_executor=residual_executor,
         )
         if result.success:
             return result
@@ -524,31 +605,186 @@ def greedy_repair_from_seeds(
     return results[0]
 
 
-def _encode_repair_observation(
-    *,
-    model: TreeDiffusionPolicyModel,
-    tokenizer: TreeDiffusionTokenizer,
+def encode_repair_observation(
     target_integrand: Expr,
     current_antiderivative: Expr,
-    residual_mode: str,
-    simplify_symbolic_residual: bool,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    tokenizer: TreeDiffusionTokenizer,
+    residual_mode: str = "both",
+    simplify_symbolic_residual: bool = True,
+    observation_timeout_seconds: float | None = None,
+    max_input_length: int | None = None,
+) -> tuple[list[str], torch.LongTensor, torch.LongTensor]:
     observation = build_observation(
         target_integrand,
         current_antiderivative,
         residual_mode=residual_mode,
         simplify_symbolic_residual=simplify_symbolic_residual,
+        observation_timeout_seconds=observation_timeout_seconds,
     )
     input_tokens = tokenizer.serialize_observation(observation) + ["<EDIT>"]
-    max_input_length = getattr(getattr(model, "config", None), "max_input_length", None)
     input_ids = torch.tensor(
         tokenizer.encode_tokens(input_tokens, pad_to_length=max_input_length),
         dtype=torch.long,
-        device=device,
-    ).unsqueeze(0)
+    )
     input_attention_mask = input_ids.ne(tokenizer.pad_id).to(dtype=torch.long)
-    return input_ids, input_attention_mask
+    return input_tokens, input_ids, input_attention_mask
+
+
+def _score_repair_candidates(
+    candidates: Sequence[_RepairCandidateForScoring],
+    *,
+    target_integrand: Expr,
+    target_integrand_prefix: str,
+    target_antiderivative: Expr | None,
+    config: RepairScoringConfig,
+    current_numeric: float | None,
+    numeric_residual_timeout_seconds: float | None,
+    symbolic_check_timeout_seconds: float | None,
+    residual_executor: Executor | None,
+) -> list[_ScoredRepairCandidate]:
+    if not candidates:
+        return []
+
+    if residual_executor is None:
+        score_results = [
+            _score_repair_candidate_local(
+                candidate,
+                target_integrand=target_integrand,
+                target_antiderivative=target_antiderivative,
+                config=config,
+                numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
+                symbolic_check_timeout_seconds=symbolic_check_timeout_seconds,
+            )
+            for candidate in candidates
+        ]
+    else:
+        target_antiderivative_prefix = (
+            None
+            if target_antiderivative is None
+            else serialize_prefix_string(target_antiderivative)
+        )
+        requests = [
+            _RepairCandidateScoreRequest(
+                edited_prefix=candidate.edited_prefix,
+                target_integrand_prefix=target_integrand_prefix,
+                target_antiderivative_prefix=target_antiderivative_prefix,
+                policy_logprob=candidate.decoded.logprob,
+                scoring=config,
+                numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
+                symbolic_check_timeout_seconds=symbolic_check_timeout_seconds,
+            )
+            for candidate in candidates
+        ]
+        score_results = list(
+            residual_executor.map(_score_repair_candidate_worker, requests)
+        )
+
+    scored_candidates: list[_ScoredRepairCandidate] = []
+    for candidate, score_result in zip(candidates, score_results, strict=True):
+        if config.require_numeric_improvement and not _numeric_improved(
+            before=current_numeric,
+            after=score_result.numeric_residual_after,
+        ):
+            continue
+        scored_candidates.append(
+            _ScoredRepairCandidate(
+                rank=candidate.rank,
+                decoded=candidate.decoded,
+                edited_tree=candidate.edited_tree,
+                edited_prefix=candidate.edited_prefix,
+                numeric_residual_after=score_result.numeric_residual_after,
+                score=score_result.score,
+                structural_distance_after=score_result.structural_distance_after,
+                exact_symbolic_match=score_result.exact_symbolic_match,
+            )
+        )
+    return scored_candidates
+
+
+def _score_repair_candidate_local(
+    candidate: _RepairCandidateForScoring,
+    *,
+    target_integrand: Expr,
+    target_antiderivative: Expr | None,
+    config: RepairScoringConfig,
+    numeric_residual_timeout_seconds: float | None,
+    symbolic_check_timeout_seconds: float | None,
+) -> _RepairCandidateScoreResult:
+    numeric_after = numeric_residual_score(
+        candidate.edited_tree,
+        target_integrand,
+        timeout_seconds=numeric_residual_timeout_seconds,
+    )
+    return _RepairCandidateScoreResult(
+        numeric_residual_after=numeric_after,
+        score=score_repair_candidate(
+            numeric_residual=numeric_after,
+            tree_size_value=tree_size(candidate.edited_tree),
+            policy_logprob=candidate.decoded.logprob,
+            config=config,
+        ),
+        structural_distance_after=_structural_distance_or_none(
+            candidate.edited_tree,
+            target_antiderivative,
+        ),
+        exact_symbolic_match=derivative_matches_target(
+            candidate.edited_tree,
+            target_integrand,
+            timeout_seconds=symbolic_check_timeout_seconds,
+        ),
+    )
+
+
+def _score_repair_candidate_worker(
+    request: _RepairCandidateScoreRequest,
+) -> _RepairCandidateScoreResult:
+    try:
+        edited_tree = canonicalize(parse_prefix_string(request.edited_prefix))
+        target_integrand = canonicalize(
+            parse_prefix_string(request.target_integrand_prefix),
+            strip_additive_constants=False,
+        )
+        target_antiderivative = (
+            None
+            if request.target_antiderivative_prefix is None
+            else canonicalize(parse_prefix_string(request.target_antiderivative_prefix))
+        )
+        numeric_after = numeric_residual_score(
+            edited_tree,
+            target_integrand,
+            timeout_seconds=request.numeric_residual_timeout_seconds,
+        )
+        return _RepairCandidateScoreResult(
+            numeric_residual_after=numeric_after,
+            score=score_repair_candidate(
+                numeric_residual=numeric_after,
+                tree_size_value=tree_size(edited_tree),
+                policy_logprob=request.policy_logprob,
+                config=request.scoring,
+            ),
+            structural_distance_after=_structural_distance_or_none(
+                edited_tree,
+                target_antiderivative,
+            ),
+            exact_symbolic_match=derivative_matches_target(
+                edited_tree,
+                target_integrand,
+                timeout_seconds=request.symbolic_check_timeout_seconds,
+            ),
+        )
+    except Exception:
+        return _RepairCandidateScoreResult(
+            numeric_residual_after=None,
+            score=score_repair_candidate(
+                numeric_residual=None,
+                tree_size_value=0,
+                policy_logprob=request.policy_logprob,
+                config=request.scoring,
+            ),
+            structural_distance_after=None,
+            exact_symbolic_match=False,
+        )
 
 
 def _repair_result(
@@ -560,6 +796,9 @@ def _repair_result(
     steps: list[RepairStep],
     initial_numeric_residual: float | None,
     final_numeric_residual: float | None,
+    best_numeric_residual: float | None,
+    best_prefix: str | None,
+    best_step_index: int | None,
     exact_symbolic_match: bool,
 ) -> RepairResult:
     success = stop_reason in {"exact_symbolic_match", "numeric_tol"}
@@ -572,6 +811,9 @@ def _repair_result(
         steps_taken=sum(1 for step in steps if step.chosen_prefix is not None),
         initial_numeric_residual=initial_numeric_residual,
         final_numeric_residual=final_numeric_residual,
+        best_numeric_residual=best_numeric_residual,
+        best_prefix=best_prefix,
+        best_step_index=best_step_index,
         exact_symbolic_match=bool(exact_symbolic_match),
         repeated_state=stop_reason == "repeated_state",
         no_candidate=stop_reason == "no_applicable_candidate",
@@ -585,6 +827,7 @@ def _failure_step(
     current_prefix: str,
     decoded: DecodedEdit | None,
     numeric_residual_before: float | None,
+    best_numeric_residual: float | None,
     structural_distance_before: int | None,
     stop_reason: str,
 ) -> RepairStep:
@@ -600,6 +843,7 @@ def _failure_step(
         policy_logprob=None if decoded is None else decoded.logprob,
         numeric_residual_before=numeric_residual_before,
         numeric_residual_after=None,
+        best_numeric_residual_so_far=best_numeric_residual,
         score=None,
         structural_distance_before=structural_distance_before,
         structural_distance_after=None,
@@ -629,6 +873,54 @@ def _numeric_improved(*, before: float | None, after: float | None) -> bool:
     return float(after) < float(before)
 
 
+def _best_numeric_residual(
+    current_best: float | None,
+    candidate_value: float | None,
+) -> float | None:
+    if candidate_value is None:
+        return current_best
+    candidate = float(candidate_value)
+    if not math.isfinite(candidate):
+        return current_best
+    if current_best is None:
+        return candidate
+    best = float(current_best)
+    if not math.isfinite(best):
+        return candidate
+    return min(best, candidate)
+
+
+def _finite_numeric(value: float | None) -> bool:
+    return value is not None and math.isfinite(float(value))
+
+
+def _is_new_best_numeric(
+    current_best: float | None,
+    candidate_value: float | None,
+) -> bool:
+    if not _finite_numeric(candidate_value):
+        return False
+    if not _finite_numeric(current_best):
+        return True
+    assert candidate_value is not None
+    assert current_best is not None
+    return float(candidate_value) < float(current_best)
+
+
+def _select_repair_candidate(
+    candidates: Sequence[_ScoredRepairCandidate],
+    *,
+    selection_strategy: Literal["rank1", "residual_scored"],
+) -> _ScoredRepairCandidate:
+    if not candidates:
+        raise ValueError("Cannot select from an empty candidate list.")
+    if selection_strategy == "rank1":
+        return min(candidates, key=lambda item: item.rank)
+    if selection_strategy == "residual_scored":
+        return min(candidates, key=lambda item: (item.score, item.rank))
+    raise ValueError("selection_strategy must be 'rank1' or 'residual_scored'.")
+
+
 def _meets_numeric_tol(value: float | None, numeric_tol: float) -> bool:
     return value is not None and math.isfinite(float(value)) and float(value) <= numeric_tol
 
@@ -638,6 +930,7 @@ __all__ = [
     "RepairScoringConfig",
     "RepairStep",
     "derivative_matches_target",
+    "encode_repair_observation",
     "greedy_repair",
     "greedy_repair_from_seeds",
     "score_repair_candidate",

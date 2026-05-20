@@ -63,6 +63,9 @@ def run_one_step_inference_eval(
     seed: int = 123,
     max_decode_length: int | None = None,
     compute_numeric_residual: bool = True,
+    diagnostic_timeout_seconds: float | None = None,
+    diagnostic_example_timeout_seconds: float | None = None,
+    numeric_residual_timeout_seconds: float | None = None,
     top_k_values: Sequence[int] = DEFAULT_TOP_K_VALUES,
     num_dump_examples: int = 50,
     dump_failures_only: bool = False,
@@ -78,6 +81,9 @@ def run_one_step_inference_eval(
         num_dump_examples=num_dump_examples,
         dump_failures_only=dump_failures_only,
         dump_improvements_only=dump_improvements_only,
+        diagnostic_timeout_seconds=diagnostic_timeout_seconds,
+        diagnostic_example_timeout_seconds=diagnostic_example_timeout_seconds,
+        numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
     )
 
     torch.manual_seed(int(seed))
@@ -117,6 +123,9 @@ def run_one_step_inference_eval(
             constrain_position=mode.constrain_position,
             max_decode_length=max_decode_length,
             compute_numeric_residual=compute_numeric_residual,
+            diagnostic_timeout_seconds=diagnostic_timeout_seconds,
+            diagnostic_example_timeout_seconds=diagnostic_example_timeout_seconds,
+            numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
             candidate_k=mode.candidate_k,
             use_first_applicable_candidate=mode.use_first_applicable_candidate,
         )
@@ -169,6 +178,9 @@ def run_one_step_inference_eval(
         "device": {"requested": str(device), "resolved": str(target_device)},
         "max_decode_length": max_decode_length,
         "compute_numeric_residual": bool(compute_numeric_residual),
+        "diagnostic_timeout_seconds": diagnostic_timeout_seconds,
+        "diagnostic_example_timeout_seconds": diagnostic_example_timeout_seconds,
+        "numeric_residual_timeout_seconds": numeric_residual_timeout_seconds,
         "modes": [asdict(mode) for mode in modes],
         "metrics_by_mode": mode_results,
         "qualitative_examples": qualitative_examples,
@@ -192,6 +204,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--max-decode-length", type=int, default=None)
+    parser.add_argument("--diagnostic-timeout-seconds", type=float, default=None)
+    parser.add_argument("--diagnostic-example-timeout-seconds", type=float, default=None)
+    parser.add_argument("--numeric-residual-timeout-seconds", type=float, default=None)
     parser.add_argument("--top-k-values", type=int, nargs="+", default=list(DEFAULT_TOP_K_VALUES))
     parser.add_argument("--num-dump-examples", type=int, default=50)
     parser.add_argument("--dump-failures-only", action="store_true")
@@ -217,6 +232,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=int(args.seed),
         max_decode_length=args.max_decode_length,
         compute_numeric_residual=bool(args.compute_numeric_residual),
+        diagnostic_timeout_seconds=args.diagnostic_timeout_seconds,
+        diagnostic_example_timeout_seconds=args.diagnostic_example_timeout_seconds,
+        numeric_residual_timeout_seconds=args.numeric_residual_timeout_seconds,
         top_k_values=tuple(int(value) for value in args.top_k_values),
         num_dump_examples=int(args.num_dump_examples),
         dump_failures_only=bool(args.dump_failures_only),
@@ -467,6 +485,7 @@ def _example_record(
         "input_tokens": input_tokens,
         "target_tokens": target_tokens,
         "gold_edit_tokens": target_tokens,
+        "mutation_trace": _mutation_trace_record(batch, row_index),
         "distance_before": distance_before,
         "numeric_residual_before": numeric_before,
         "predicted_candidates": candidate_records,
@@ -559,6 +578,36 @@ def _failure_type(
     return "no_applicable_candidate"
 
 
+def _mutation_trace_record(batch: Mapping[str, Any], row_index: int) -> dict[str, Any] | None:
+    mode = _metadata_item(batch, "trajectory_mode", row_index, default=None)
+    trajectory = _metadata_item(batch, "trajectory", row_index, default=None)
+    if mode is None and trajectory is None:
+        return None
+    return {
+        "mode": mode,
+        "forward": {
+            "complete": _metadata_item(batch, "forward_complete", row_index, default=None),
+            "num_mutations": _metadata_item(batch, "forward_num_mutations", row_index, default=None),
+            "mutation_kinds": _metadata_item(batch, "forward_mutation_kinds", row_index, default=None),
+            "start_prefix": _metadata_item(batch, "forward_start_prefix", row_index, default=None),
+            "end_prefix": _metadata_item(batch, "forward_end_prefix", row_index, default=None),
+        },
+        "gold_repair_step": {
+            "step_index": _metadata_item(batch, "repair_step_index", row_index, default=None),
+            "mutation_kind": _metadata_item(batch, "repair_mutation_kind", row_index, default=None),
+            "reason": _metadata_item(batch, "repair_reason", row_index, default=None),
+            "selected_node_id": _metadata_item(batch, "repair_selected_node_id", row_index, default=None),
+            "selected_node_span": _metadata_item(batch, "repair_selected_node_span", row_index, default=None),
+            "original_subtree_prefix": _metadata_item(batch, "repair_original_subtree_prefix", row_index, default=None),
+            "replacement_subtree_prefix": _metadata_item(batch, "repair_replacement_subtree_prefix", row_index, default=None),
+            "distance_before": _metadata_item(batch, "repair_distance_before", row_index, default=None),
+            "distance_after": _metadata_item(batch, "repair_distance_after", row_index, default=None),
+        },
+        "repair_reached_target": _metadata_item(batch, "repair_reached_target", row_index, default=None),
+        "repair_step_count": _metadata_item(batch, "repair_step_count", row_index, default=None),
+    }
+
+
 def _derived_comparison(
     metrics: Mapping[str, Any],
     *,
@@ -607,6 +656,9 @@ def _validate_args(
     num_dump_examples: int,
     dump_failures_only: bool,
     dump_improvements_only: bool,
+    diagnostic_timeout_seconds: float | None,
+    diagnostic_example_timeout_seconds: float | None,
+    numeric_residual_timeout_seconds: float | None,
 ) -> None:
     if (data is None) == (precomputed_data_dir is None):
         raise ValueError("Provide exactly one data source: --data or --precomputed-data-dir.")
@@ -624,6 +676,14 @@ def _validate_args(
         raise ValueError("num_dump_examples must be >= 0.")
     if dump_failures_only and dump_improvements_only:
         raise ValueError("Use at most one of dump_failures_only or dump_improvements_only.")
+    _validate_optional_timeout("diagnostic_timeout_seconds", diagnostic_timeout_seconds)
+    _validate_optional_timeout("diagnostic_example_timeout_seconds", diagnostic_example_timeout_seconds)
+    _validate_optional_timeout("numeric_residual_timeout_seconds", numeric_residual_timeout_seconds)
+
+
+def _validate_optional_timeout(name: str, value: float | None) -> None:
+    if value is not None and value <= 0.0:
+        raise ValueError(f"{name} must be > 0 when provided.")
 
 
 def _section_prefix(

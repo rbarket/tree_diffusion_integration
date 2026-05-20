@@ -9,6 +9,7 @@ from src.mathlang.parser import parse_prefix_string
 from src.tree_diffusion.repair import (
     RepairScoringConfig,
     derivative_matches_target,
+    encode_repair_observation,
     greedy_repair,
     greedy_repair_from_seeds,
     score_repair_candidate,
@@ -81,6 +82,24 @@ class TreeDiffusionRepairTests(unittest.TestCase):
             )
         )
 
+    def test_encode_repair_observation_matches_training_input_shape(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+
+        tokens, input_ids, attention_mask = encode_repair_observation(
+            parse_prefix_string("x"),
+            parse_prefix_string("INT+ 1"),
+            tokenizer=tokenizer,
+            max_input_length=128,
+        )
+
+        self.assertEqual(tokens[-1], "<EDIT>")
+        self.assertEqual(input_ids.ndim, 1)
+        self.assertEqual(attention_mask.shape, input_ids.shape)
+        self.assertTrue(torch.equal(attention_mask, input_ids.ne(tokenizer.pad_id).long()))
+        decoded_nonpad = tokenizer.decode_ids(input_ids[attention_mask.bool()].tolist())
+        self.assertEqual(decoded_nonpad, tokens)
+        self.assertNotIn("pow", tokens)
+
     def test_greedy_repair_succeeds_in_one_step(self) -> None:
         tokenizer = TreeDiffusionTokenizer(max_positions=128)
         model = _correct_exponent_model(tokenizer)
@@ -101,7 +120,14 @@ class TreeDiffusionRepairTests(unittest.TestCase):
         self.assertEqual(result.stop_reason, "exact_symbolic_match")
         self.assertEqual(result.steps_taken, 1)
         self.assertEqual(result.final_prefix, "pow x INT+ 3")
+        self.assertEqual(result.best_numeric_residual, result.final_numeric_residual)
+        self.assertEqual(result.best_prefix, "pow x INT+ 3")
+        self.assertEqual(result.best_step_index, 1)
         self.assertEqual(result.steps[0].candidate_rank, 1)
+        self.assertEqual(
+            result.steps[0].best_numeric_residual_so_far,
+            result.best_numeric_residual,
+        )
         self.assertLess(
             result.steps[0].numeric_residual_after,
             result.steps[0].numeric_residual_before,
@@ -187,6 +213,9 @@ class TreeDiffusionRepairTests(unittest.TestCase):
         self.assertEqual(result.stop_reason, "exact_symbolic_match")
         self.assertEqual(result.steps_taken, 0)
         self.assertEqual(result.steps, [])
+        self.assertEqual(result.best_numeric_residual, result.initial_numeric_residual)
+        self.assertEqual(result.best_prefix, result.initial_prefix)
+        self.assertEqual(result.best_step_index, 0)
 
     def test_greedy_repair_max_steps_zero_only_runs_initial_checks(self) -> None:
         tokenizer = TreeDiffusionTokenizer(max_positions=128)
@@ -205,6 +234,122 @@ class TreeDiffusionRepairTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.stop_reason, "max_steps")
         self.assertEqual(result.steps_taken, 0)
+        self.assertEqual(result.best_numeric_residual, result.initial_numeric_residual)
+
+    def test_greedy_repair_max_steps_one_is_respected(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        model = _rank1_worse_rank2_better_model(tokenizer)
+
+        result = greedy_repair(
+            model,  # type: ignore[arg-type]
+            _target_integrand(),
+            parse_prefix_string("pow x INT+ 5"),
+            tokenizer=tokenizer,
+            device="cpu",
+            max_steps=1,
+            candidate_k=2,
+            max_decode_length=4,
+            selection_strategy="rank1",
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "max_steps")
+        self.assertEqual(result.steps_taken, 1)
+
+    def test_greedy_repair_patience_stops_after_non_improving_transition(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        model = _worse_exponent_model(tokenizer)
+
+        result = greedy_repair(
+            model,  # type: ignore[arg-type]
+            _target_integrand(),
+            parse_prefix_string("pow x INT+ 5"),
+            tokenizer=tokenizer,
+            device="cpu",
+            max_steps=3,
+            candidate_k=1,
+            max_decode_length=4,
+            patience=1,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "no_numeric_improvement")
+        self.assertEqual(result.steps_taken, 1)
+
+    def test_selection_strategy_rank1_uses_first_applicable_candidate(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        model = _rank1_worse_rank2_better_model(tokenizer)
+
+        result = greedy_repair(
+            model,  # type: ignore[arg-type]
+            _target_integrand(),
+            parse_prefix_string("pow x INT+ 5"),
+            tokenizer=tokenizer,
+            device="cpu",
+            max_steps=1,
+            candidate_k=2,
+            max_decode_length=4,
+            selection_strategy="rank1",
+        )
+
+        self.assertEqual(result.steps[0].candidate_rank, 1)
+        self.assertEqual(result.final_prefix, "pow x INT+ 4")
+
+    def test_selection_strategy_residual_scored_can_choose_lower_rank_candidate(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        model = _rank1_worse_rank2_better_model(tokenizer)
+
+        result = greedy_repair(
+            model,  # type: ignore[arg-type]
+            _target_integrand(),
+            parse_prefix_string("pow x INT+ 5"),
+            tokenizer=tokenizer,
+            device="cpu",
+            max_steps=1,
+            candidate_k=2,
+            max_decode_length=4,
+            selection_strategy="residual_scored",
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.steps[0].candidate_rank, 2)
+        self.assertEqual(result.final_prefix, "pow x INT+ 3")
+
+    def test_parallel_candidate_scoring_path_matches_serial_result(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+
+        serial_result = greedy_repair(
+            _rank1_worse_rank2_better_model(tokenizer),  # type: ignore[arg-type]
+            _target_integrand(),
+            parse_prefix_string("pow x INT+ 5"),
+            tokenizer=tokenizer,
+            device="cpu",
+            max_steps=1,
+            candidate_k=2,
+            max_decode_length=4,
+            selection_strategy="residual_scored",
+        )
+        parallel_result = greedy_repair(
+            _rank1_worse_rank2_better_model(tokenizer),  # type: ignore[arg-type]
+            _target_integrand(),
+            parse_prefix_string("pow x INT+ 5"),
+            tokenizer=tokenizer,
+            device="cpu",
+            max_steps=1,
+            candidate_k=2,
+            max_decode_length=4,
+            selection_strategy="residual_scored",
+            residual_executor=_InlineExecutor(),
+        )
+
+        self.assertEqual(parallel_result.success, serial_result.success)
+        self.assertEqual(parallel_result.stop_reason, serial_result.stop_reason)
+        self.assertEqual(parallel_result.final_prefix, serial_result.final_prefix)
+        self.assertEqual(parallel_result.steps[0].candidate_rank, serial_result.steps[0].candidate_rank)
+        self.assertEqual(
+            parallel_result.steps[0].numeric_residual_after,
+            serial_result.steps[0].numeric_residual_after,
+        )
 
     def test_greedy_repair_from_seeds_returns_first_success(self) -> None:
         tokenizer = TreeDiffusionTokenizer(max_positions=128)
@@ -219,6 +364,7 @@ class TreeDiffusionRepairTests(unittest.TestCase):
             max_steps=2,
             candidate_k=1,
             max_decode_length=4,
+            patience=2,
         )
 
         self.assertTrue(result.success)
@@ -238,6 +384,7 @@ class TreeDiffusionRepairTests(unittest.TestCase):
             max_steps=1,
             candidate_k=1,
             max_decode_length=4,
+            selection_strategy="residual_scored",
         )
 
         self.assertFalse(result.success)
@@ -303,6 +450,11 @@ class _FixedLogitModel(torch.nn.Module):
         return logits
 
 
+class _InlineExecutor:
+    def map(self, fn, iterable):
+        return map(fn, iterable)
+
+
 def _correct_exponent_model(tokenizer: TreeDiffusionTokenizer) -> _FixedLogitModel:
     return _FixedLogitModel(
         tokenizer,
@@ -328,6 +480,27 @@ def _same_exponent_model(tokenizer: TreeDiffusionTokenizer) -> _FixedLogitModel:
     return _FixedLogitModel(
         tokenizer,
         [{"<POS_2>": 10.0}, {"INT+": 10.0}, {"5": 10.0}, {"<eos>": 10.0}],
+        max_target_length=8,
+    )
+
+
+def _worse_exponent_model(tokenizer: TreeDiffusionTokenizer) -> _FixedLogitModel:
+    return _FixedLogitModel(
+        tokenizer,
+        [{"<POS_2>": 10.0}, {"INT+": 10.0}, {"6": 10.0}, {"<eos>": 10.0}],
+        max_target_length=8,
+    )
+
+
+def _rank1_worse_rank2_better_model(tokenizer: TreeDiffusionTokenizer) -> _FixedLogitModel:
+    return _FixedLogitModel(
+        tokenizer,
+        [
+            {"<POS_2>": 10.0},
+            {"INT+": 10.0},
+            {"4": 10.0, "3": 9.0},
+            {"<eos>": 10.0},
+        ],
         max_target_length=8,
     )
 

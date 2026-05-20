@@ -16,6 +16,7 @@ from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 from tests.test_tree_diffusion_repair import (
     _correct_exponent_model,
     _invalid_replacement_model,
+    _worse_exponent_model,
 )
 from tests.tree_diffusion_test_utils import (
     small_policy_model,
@@ -74,6 +75,30 @@ class TreeDiffusionRepairEvaluationTests(unittest.TestCase):
         self.assertEqual(summary.stop_reason_counts.get("no_applicable_candidate"), 1)
         _assert_rates_in_bounds(self, summary)
 
+    def test_evaluate_greedy_repair_counts_no_numeric_improvement(self) -> None:
+        tokenizer = TreeDiffusionTokenizer(max_positions=128)
+        loader = DataLoader([_known_repair_batch()], batch_size=None)
+        model = _worse_exponent_model(tokenizer)
+
+        summary = evaluate_greedy_repair(
+            model,  # type: ignore[arg-type]
+            loader,
+            tokenizer=tokenizer,
+            device="cpu",
+            num_batches=1,
+            max_steps=3,
+            candidate_k=1,
+            max_decode_length=4,
+            patience=1,
+            selection_strategy="rank1",
+        )
+
+        self.assertEqual(summary.examples, 1)
+        self.assertEqual(summary.success_rate, 0.0)
+        self.assertEqual(summary.no_numeric_improvement_rate, 1.0)
+        self.assertEqual(summary.stop_reason_counts.get("no_numeric_improvement"), 1)
+        _assert_rates_in_bounds(self, summary)
+
     def test_cli_writes_summary_and_dump_examples(self) -> None:
         with TemporaryDirectory() as temp_dir:
             work_dir = Path(temp_dir)
@@ -99,9 +124,15 @@ class TreeDiffusionRepairEvaluationTests(unittest.TestCase):
                     "--device",
                     "cpu",
                     "--max-steps",
-                    "0",
+                    "1",
                     "--candidate-k",
                     "1",
+                    "--patience",
+                    "1",
+                    "--selection-strategy",
+                    "rank1",
+                    "--residual-workers",
+                    "0",
                     "--no-structural-metrics",
                     "--dump-examples",
                     str(dump),
@@ -115,20 +146,34 @@ class TreeDiffusionRepairEvaluationTests(unittest.TestCase):
             payload = json.loads(output.read_text(encoding="utf-8"))
             for key in (
                 "examples",
-                "success_rate",
-                "exact_symbolic_match_rate",
-                "numeric_success_rate",
-                "stop_reason_counts",
+                "selection_strategy",
+                "candidate_k",
+                "overall",
+                "by_used_random_init",
+                "by_num_mutations",
+                "best_so_far",
+                "per_step",
+                "candidate_rank",
                 "dump_examples",
+                "residual_workers",
             ):
                 self.assertIn(key, payload)
+            self.assertEqual(payload["residual_workers"], 0)
+            self.assertIn("success_rate", payload["overall"])
+            self.assertIn("stop_reason_counts", payload)
             self.assertTrue(dump.exists())
             row = json.loads(dump.read_text(encoding="utf-8").splitlines()[0])
             self.assertIn("target_integrand_prefix", row)
             self.assertIn("target_antiderivative_prefix", row)
             self.assertIn("initial_prefix", row)
             self.assertIn("final_prefix", row)
+            self.assertIn("best_numeric_residual", row)
+            self.assertIn("best_prefix", row)
+            self.assertIn("best_step_index", row)
             self.assertIn("steps", row)
+            if row["steps"]:
+                self.assertIn("candidate_rank", row["steps"][0])
+                self.assertIn("best_numeric_residual_so_far", row["steps"][0])
 
 
 def _known_repair_batch() -> dict:

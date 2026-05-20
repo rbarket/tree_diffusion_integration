@@ -18,6 +18,15 @@ from src.tree_diffusion.decoding import (
     predict_greedy_edit,
     valid_position_token_ids,
 )
+from src.tree_diffusion.beam_search import (
+    BeamSearchResult,
+    BeamSearchScoringConfig,
+    BeamSearchState,
+    BeamSearchStopConfig,
+    beam_search_repair,
+    beam_search_repair_from_seeds,
+    score_beam_state,
+)
 from src.tree_diffusion.edit_path import (
     EditTarget,
     FirstMismatch,
@@ -35,8 +44,19 @@ from src.tree_diffusion.eval_one_step import (
     numeric_residual_score,
 )
 from src.tree_diffusion.evaluate_repair import (
+    RepairEvaluationRecord,
     RepairEvaluationSummary,
+    RepairGroupSummary,
     evaluate_greedy_repair,
+    repair_evaluation_summary_to_json,
+    summarize_repair_results,
+)
+from src.tree_diffusion.evaluate_beam_search import (
+    BeamRepairEvaluationRecord,
+    BeamRepairEvaluationSummary,
+    beam_repair_evaluation_summary_to_json,
+    evaluate_beam_repair,
+    summarize_beam_repair_results,
 )
 from src.tree_diffusion.label_validation import (
     EditLabelValidationResult,
@@ -87,6 +107,7 @@ from src.tree_diffusion.repair import (
     RepairScoringConfig,
     RepairStep,
     derivative_matches_target,
+    encode_repair_observation,
     greedy_repair,
     greedy_repair_from_seeds,
     score_repair_candidate,

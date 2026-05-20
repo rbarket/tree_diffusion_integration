@@ -77,6 +77,7 @@ class PrecomputedTreeDiffusionDataset(Dataset):
         if self.include_metadata:
             warnings = _json_list(row.get("warnings_json", "[]"))
             trajectory_json = _optional_string(row.get("trajectory_json"))
+            trajectory = _json_object(trajectory_json) if trajectory_json is not None else None
             item.update(
                 {
                     "input_tokens": _json_list(row["input_tokens_json"]),
@@ -97,9 +98,10 @@ class PrecomputedTreeDiffusionDataset(Dataset):
                     "source": _optional_string(row.get("source")),
                 }
             )
-            if trajectory_json is not None:
+            if trajectory is not None:
                 item["trajectory_json"] = trajectory_json
-                item["trajectory"] = json.loads(trajectory_json)
+                item["trajectory"] = trajectory
+                item.update(_trajectory_metadata(trajectory))
 
         return item
 
@@ -155,6 +157,17 @@ def _json_list(value: Any) -> list[Any]:
     return decoded
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not _has_value(value):
+        return {}
+    decoded = json.loads(str(value))
+    if not isinstance(decoded, dict):
+        raise ValueError("Expected a JSON object.")
+    return decoded
+
+
 def _labels_from_target_ids(target_ids: torch.Tensor, pad_id: int) -> torch.Tensor:
     labels = target_ids.clone()
     labels[target_ids == pad_id] = -100
@@ -184,6 +197,73 @@ def _optional_int(value: Any) -> int | None:
 def _int_value(value: Any, *, default: int) -> int:
     parsed = _optional_int(value)
     return default if parsed is None else parsed
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if not _has_value(value):
+        return None
+    return bool(value)
+
+
+def _mapping_or_empty(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _mapping_list(value: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _int_list(value: Any) -> list[int] | None:
+    if not isinstance(value, list):
+        return None
+    parsed: list[int] = []
+    for item in value:
+        try:
+            parsed.append(int(item))
+        except (TypeError, ValueError):
+            return None
+    return parsed
+
+
+def _trajectory_metadata(trajectory: Mapping[str, Any]) -> dict[str, Any]:
+    forward = _mapping_or_empty(trajectory.get("forward"))
+    repair = _mapping_or_empty(trajectory.get("repair"))
+    forward_steps = _mapping_list(forward.get("steps"))
+    repair_steps = _mapping_list(repair.get("steps"))
+    first_repair_step = repair_steps[0] if repair_steps else {}
+
+    return {
+        "trajectory_mode": _optional_string(trajectory.get("mode")),
+        "forward_complete": _optional_bool(forward.get("complete")),
+        "forward_start_prefix": _optional_string(forward.get("start_prefix")),
+        "forward_end_prefix": _optional_string(forward.get("end_prefix")),
+        "forward_num_mutations": _optional_int(forward.get("num_mutations")),
+        "forward_mutation_kinds": [
+            str(step["mutation_kind"])
+            for step in forward_steps
+            if _has_value(step.get("mutation_kind"))
+        ],
+        "repair_reached_target": _optional_bool(repair.get("reached_target")),
+        "repair_step_count": len(repair_steps),
+        "repair_step": dict(first_repair_step),
+        "repair_step_index": _optional_int(first_repair_step.get("step_index")),
+        "repair_mutation_kind": _optional_string(first_repair_step.get("mutation_kind")),
+        "repair_reason": _optional_string(first_repair_step.get("reason")),
+        "repair_selected_node_id": _optional_int(first_repair_step.get("selected_node_id")),
+        "repair_selected_node_span": _int_list(first_repair_step.get("selected_node_span")),
+        "repair_distance_before": _optional_int(first_repair_step.get("distance_before")),
+        "repair_distance_after": _optional_int(first_repair_step.get("distance_after")),
+        "repair_original_subtree_prefix": _optional_string(
+            first_repair_step.get("original_subtree_prefix")
+        ),
+        "repair_replacement_subtree_prefix": _optional_string(
+            first_repair_step.get("replacement_subtree_prefix")
+        ),
+        "repair_before_prefix": _optional_string(first_repair_step.get("before_prefix")),
+        "repair_after_prefix": _optional_string(first_repair_step.get("after_prefix")),
+    }
 
 
 __all__ = [

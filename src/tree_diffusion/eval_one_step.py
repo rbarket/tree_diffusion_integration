@@ -544,6 +544,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--constrain-position", dest="constrain_position", action="store_true", default=True)
     parser.add_argument("--no-constrain-position", dest="constrain_position", action="store_false")
     parser.add_argument("--max-decode-length", type=int, default=None)
+    parser.add_argument("--diagnostic-timeout-seconds", type=float, default=None)
+    parser.add_argument("--diagnostic-example-timeout-seconds", type=float, default=None)
+    parser.add_argument("--numeric-residual-timeout-seconds", type=float, default=None)
     parser.add_argument("--candidate-k", type=int, default=1)
     parser.add_argument(
         "--use-first-applicable-candidate",
@@ -576,6 +579,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--batch-size must be >= 1.")
     if args.candidate_k < 1:
         raise ValueError("--candidate-k must be >= 1.")
+    _validate_optional_timeout("diagnostic_timeout_seconds", args.diagnostic_timeout_seconds)
+    _validate_optional_timeout("diagnostic_example_timeout_seconds", args.diagnostic_example_timeout_seconds)
+    _validate_optional_timeout("numeric_residual_timeout_seconds", args.numeric_residual_timeout_seconds)
 
     torch.manual_seed(int(args.seed))
     device = _resolve_device(str(args.device))
@@ -605,6 +611,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         constrain_position=bool(args.constrain_position),
         max_decode_length=args.max_decode_length,
         compute_numeric_residual=bool(args.compute_numeric_residual),
+        diagnostic_timeout_seconds=args.diagnostic_timeout_seconds,
+        diagnostic_example_timeout_seconds=args.diagnostic_example_timeout_seconds,
+        numeric_residual_timeout_seconds=args.numeric_residual_timeout_seconds,
         candidate_k=int(args.candidate_k),
         use_first_applicable_candidate=bool(args.use_first_applicable_candidate),
     )
