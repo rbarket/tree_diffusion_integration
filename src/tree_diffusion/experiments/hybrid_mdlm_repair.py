@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import shutil
 import sys
 from typing import Any, Mapping, Sequence
 
@@ -207,6 +208,8 @@ def evaluate_hybrid_mdlm_repair(
     numeric_patience: int | None = 5,
     structural_patience: int | None = None,
     numeric_tol: float = 1e-10,
+    numeric_residual_timeout_seconds: float | None = 2.0,
+    symbolic_check_timeout_seconds: float | None = 2.0,
     reject_mask_or_unk: bool = True,
     allow_complex_constant: bool = True,
     seed_selection: str = "all_parseable",
@@ -214,6 +217,8 @@ def evaluate_hybrid_mdlm_repair(
     part_size: int = 500,
     progress_every: int = 25,
     residual_workers: int = 16,
+    resume: bool = False,
+    overwrite: bool = False,
     progress: bool = True,
 ) -> HybridMdlmRepairSummary:
     _validate_eval_args(
@@ -225,10 +230,14 @@ def evaluate_hybrid_mdlm_repair(
         numeric_patience=numeric_patience,
         structural_patience=structural_patience,
         numeric_tol=numeric_tol,
+        numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
+        symbolic_check_timeout_seconds=symbolic_check_timeout_seconds,
         seed_selection=seed_selection,
         part_size=part_size,
         progress_every=progress_every,
         residual_workers=residual_workers,
+        resume=resume,
+        overwrite=overwrite,
     )
     target_device = _resolve_device(str(device))
     tokenizer, model = _load_cli_model_and_tokenizer(
@@ -251,24 +260,45 @@ def evaluate_hybrid_mdlm_repair(
     )
 
     parts_dir = None if examples_parts_dir is None else Path(examples_parts_dir)
-    if parts_dir is not None:
-        parts_dir.mkdir(parents=True, exist_ok=True)
-    current_part: list[HybridRepairExampleResult] = []
+    existing_results: list[HybridRepairExampleResult] = []
+    completed_examples = 0
     next_part_index = 0
-    results: list[HybridRepairExampleResult] = []
+    if parts_dir is not None:
+        if overwrite and parts_dir.exists():
+            shutil.rmtree(parts_dir)
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        existing_part_paths = _examples_part_paths(parts_dir)
+        if resume:
+            existing_results = _load_examples_part_results(parts_dir)
+            completed_examples = len(existing_results)
+            if completed_examples > target_examples:
+                raise ValueError(
+                    "Cannot resume: completed part rows exceed requested target examples "
+                    f"({completed_examples} > {target_examples})."
+                )
+            next_part_index = _next_examples_part_index(parts_dir)
+        elif existing_part_paths:
+            raise FileExistsError(
+                f"Examples parts already exist in {parts_dir}. Use --resume to continue "
+                "or --overwrite to replace them."
+            )
+    current_part: list[HybridRepairExampleResult] = []
+    results: list[HybridRepairExampleResult] = list(existing_results)
     _progress(
         "hybrid_mdlm_repair_start "
         f"target={target_examples} start={int(start)} limit={limit} "
         f"part_size={int(part_size)} progress_every={int(progress_every)} "
-        f"residual_workers={int(residual_workers)}",
+        f"residual_workers={int(residual_workers)} resume={bool(resume)} "
+        f"completed={completed_examples} next_part={next_part_index:06d}",
         enabled=progress,
     )
 
     with _residual_executor_context(int(residual_workers)) as residual_executor:
-        for group_ordinal, group in enumerate(selected_groups):
+        for local_offset, group in enumerate(selected_groups[completed_examples:]):
+            group_ordinal = int(start) + completed_examples + local_offset
             result = _evaluate_group(
                 group=group,
-                group_ordinal=group_ordinal + int(start),
+                group_ordinal=group_ordinal,
                 model=model,
                 tokenizer=tokenizer,
                 device=target_device,
@@ -277,6 +307,8 @@ def evaluate_hybrid_mdlm_repair(
                 stopping=stopping,
                 reject_mask_or_unk=bool(reject_mask_or_unk),
                 allow_complex_constant=bool(allow_complex_constant),
+                numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
+                symbolic_check_timeout_seconds=symbolic_check_timeout_seconds,
                 seed_selection=str(seed_selection),
                 use_fallback_seeds=bool(use_fallback_seeds),
                 residual_executor=residual_executor,
@@ -496,6 +528,8 @@ def _evaluate_group(
     stopping: BeamSearchStopConfig,
     reject_mask_or_unk: bool,
     allow_complex_constant: bool,
+    numeric_residual_timeout_seconds: float | None,
+    symbolic_check_timeout_seconds: float | None,
     seed_selection: str,
     use_fallback_seeds: bool,
     residual_executor: Any,
@@ -566,12 +600,20 @@ def _evaluate_group(
         )
 
     initial_exact_by_attempt = {
-        int(result.attempt_index): _safe_exact_match(result.seed, target_integrand)
+        int(result.attempt_index): _safe_exact_match(
+            result.seed,
+            target_integrand,
+            timeout_seconds=symbolic_check_timeout_seconds,
+        )
         for result in parseable_results
         if result.seed is not None
     }
     initial_numeric_by_attempt = {
-        int(result.attempt_index): _safe_numeric_residual(result.seed, target_integrand)
+        int(result.attempt_index): _safe_numeric_residual(
+            result.seed,
+            target_integrand,
+            timeout_seconds=numeric_residual_timeout_seconds,
+        )
         for result in parseable_results
         if result.seed is not None
     }
@@ -604,6 +646,8 @@ def _evaluate_group(
             candidate_k=candidate_k,
             stopping=stopping,
             target_antiderivative=target_antiderivative,
+            numeric_residual_timeout_seconds=numeric_residual_timeout_seconds,
+            symbolic_check_timeout_seconds=symbolic_check_timeout_seconds,
             residual_executor=residual_executor,
         )
     except Exception as exc:  # noqa: BLE001 - one repair failure should not drop the example.
@@ -806,20 +850,31 @@ def _parse_target_integrand(prefix: str) -> Expr | None:
         return None
 
 
-def _safe_exact_match(seed: Expr | None, target_integrand: Expr) -> bool:
+def _safe_exact_match(
+    seed: Expr | None,
+    target_integrand: Expr,
+    *,
+    timeout_seconds: float | None = 2.0,
+) -> bool:
     if seed is None:
         return False
     try:
-        return bool(derivative_matches_target(seed, target_integrand))
+        return bool(
+            derivative_matches_target(
+                seed,
+                target_integrand,
+                timeout_seconds=timeout_seconds,
+            )
+        )
     except Exception:
         return False
 
 
-def _safe_numeric_residual(seed: Expr | None, target_integrand: Expr) -> float | None:
+def _safe_numeric_residual(seed: Expr | None, target_integrand: Expr, timeout_seconds: float | None = 2.0) -> float | None:
     if seed is None:
         return None
     try:
-        return numeric_residual_score(seed, target_integrand)
+        return numeric_residual_score(seed, target_integrand, timeout_seconds=timeout_seconds)
     except Exception:
         return None
 
@@ -861,6 +916,64 @@ def _write_examples_part(
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     _write_json(parts_dir / f"part_{part_index:06d}.summary.json", part_summary)
+
+
+def _examples_part_paths(parts_dir: Path) -> list[Path]:
+    return sorted(parts_dir.glob("part_*.jsonl"))
+
+
+def _next_examples_part_index(parts_dir: Path) -> int:
+    indices = [_examples_part_index(path) for path in _examples_part_paths(parts_dir)]
+    indices = [index for index in indices if index is not None]
+    return 0 if not indices else max(indices) + 1
+
+
+def _examples_part_index(path: Path) -> int | None:
+    stem = path.stem
+    if not stem.startswith("part_"):
+        return None
+    try:
+        return int(stem.removeprefix("part_"))
+    except ValueError:
+        return None
+
+
+def _load_examples_part_results(parts_dir: Path) -> list[HybridRepairExampleResult]:
+    results: list[HybridRepairExampleResult] = []
+    for path in _examples_part_paths(parts_dir):
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                payload = json.loads(stripped)
+                if not isinstance(payload, Mapping):
+                    raise TypeError(
+                        f"Expected JSON object in {path}:{line_number}, got {type(payload).__name__}."
+                    )
+                results.append(_example_result_from_mapping(payload, path=path, line_number=line_number))
+    return results
+
+
+def _example_result_from_mapping(
+    payload: Mapping[str, Any],
+    *,
+    path: Path,
+    line_number: int,
+) -> HybridRepairExampleResult:
+    field_names = {field.name for field in fields(HybridRepairExampleResult)}
+    missing = [
+        field.name
+        for field in fields(HybridRepairExampleResult)
+        if field.default is MISSING and field.default_factory is MISSING and field.name not in payload
+    ]
+    if missing:
+        raise KeyError(
+            f"Existing result row {path}:{line_number} is missing required field(s): "
+            + ", ".join(missing)
+        )
+    values = {name: payload[name] for name in field_names if name in payload}
+    return HybridRepairExampleResult(**values)
 
 
 def _write_examples_parts_manifest(
@@ -963,10 +1076,14 @@ def _validate_eval_args(
     numeric_patience: int | None,
     structural_patience: int | None,
     numeric_tol: float,
+    numeric_residual_timeout_seconds: float | None,
+    symbolic_check_timeout_seconds: float | None,
     seed_selection: str,
     part_size: int,
     progress_every: int,
     residual_workers: int,
+    resume: bool,
+    overwrite: bool,
 ) -> None:
     if int(start) < 0:
         raise ValueError("start must be >= 0.")
@@ -984,6 +1101,10 @@ def _validate_eval_args(
         raise ValueError("structural_patience must be None or >= 0.")
     if float(numeric_tol) < 0.0:
         raise ValueError("numeric_tol must be >= 0.")
+    if numeric_residual_timeout_seconds is not None and float(numeric_residual_timeout_seconds) <= 0.0:
+        raise ValueError("numeric_residual_timeout_seconds must be None or > 0.")
+    if symbolic_check_timeout_seconds is not None and float(symbolic_check_timeout_seconds) <= 0.0:
+        raise ValueError("symbolic_check_timeout_seconds must be None or > 0.")
     if seed_selection not in _VALID_SEED_SELECTIONS:
         raise ValueError(
             "seed_selection must be one of: " + ", ".join(sorted(_VALID_SEED_SELECTIONS))
@@ -994,6 +1115,8 @@ def _validate_eval_args(
         raise ValueError("progress_every must be >= 0.")
     if int(residual_workers) < 0:
         raise ValueError("residual_workers must be >= 0.")
+    if resume and overwrite:
+        raise ValueError("resume and overwrite cannot both be true.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1014,6 +1137,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--numeric-patience", type=int, default=5)
     parser.add_argument("--structural-patience", type=int, default=None)
     parser.add_argument("--numeric-tol", type=float, default=1e-10)
+    parser.add_argument("--numeric-residual-timeout-seconds", type=float, default=2.0)
+    parser.add_argument("--symbolic-check-timeout-seconds", type=float, default=2.0)
     parser.add_argument(
         "--seed-selection",
         choices=sorted(_VALID_SEED_SELECTIONS),
@@ -1023,6 +1148,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--part-size", type=int, default=500)
     parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--residual-workers", type=int, default=16)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--reject-mask-or-unk", dest="reject_mask_or_unk", action="store_true", default=True)
     parser.add_argument("--allow-mask-or-unk", dest="reject_mask_or_unk", action="store_false")
@@ -1048,6 +1175,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         numeric_patience=args.numeric_patience,
         structural_patience=args.structural_patience,
         numeric_tol=args.numeric_tol,
+        numeric_residual_timeout_seconds=args.numeric_residual_timeout_seconds,
+        symbolic_check_timeout_seconds=args.symbolic_check_timeout_seconds,
         reject_mask_or_unk=args.reject_mask_or_unk,
         allow_complex_constant=args.allow_complex_constant,
         seed_selection=args.seed_selection,
@@ -1055,6 +1184,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         part_size=args.part_size,
         progress_every=args.progress_every,
         residual_workers=args.residual_workers,
+        resume=args.resume,
+        overwrite=args.overwrite,
         progress=not bool(args.quiet),
     )
     print(json.dumps(_json_safe(asdict(summary)), indent=2, sort_keys=True))

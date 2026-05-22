@@ -532,3 +532,63 @@ def test_progress_and_sharded_example_parts(tmp_path, monkeypatch, capsys) -> No
     manifest = json.loads((parts_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["part_count"] == 2
     assert manifest["completed_examples"] == 3
+
+
+def test_resume_continues_after_existing_example_parts(tmp_path, monkeypatch, capsys) -> None:
+    _patch_loader(monkeypatch)
+    predictions = tmp_path / "predictions.jsonl"
+    parts_dir = tmp_path / "parts"
+    _write_jsonl(
+        predictions,
+        [
+            _prediction_row(row_index=30, attempt_index=0, pred_prefix="x"),
+            _prediction_row(row_index=31, attempt_index=0, pred_prefix="x"),
+            _prediction_row(row_index=32, attempt_index=0, pred_prefix="x"),
+        ],
+    )
+    monkeypatch.setattr(hybrid, "derivative_matches_target", lambda *args, **kwargs: False)
+    monkeypatch.setattr(hybrid, "numeric_residual_score", lambda *args, **kwargs: 1.0)
+    evaluated: list[str] = []
+
+    def fake_repair(model, target_integrand, seeds, **kwargs):
+        del model, target_integrand, kwargs
+        evaluated.append(_prefix(seeds[0]))
+        return _beam_result(success=False)
+
+    monkeypatch.setattr(hybrid, "beam_search_repair_from_seeds", fake_repair)
+
+    first_summary = hybrid.evaluate_hybrid_mdlm_repair(
+        predictions_path=predictions,
+        tree_checkpoint="fake.ckpt",
+        examples_parts_dir=parts_dir,
+        limit=1,
+        part_size=1,
+        progress_every=1,
+        device="cpu",
+    )
+    assert first_summary.examples == 1
+    assert len(_read_jsonl(parts_dir / "part_000000.jsonl")) == 1
+
+    evaluated.clear()
+    resumed_summary = hybrid.evaluate_hybrid_mdlm_repair(
+        predictions_path=predictions,
+        tree_checkpoint="fake.ckpt",
+        examples_parts_dir=parts_dir,
+        part_size=1,
+        progress_every=1,
+        resume=True,
+        device="cpu",
+    )
+
+    captured = capsys.readouterr()
+    assert "resume=True completed=1 next_part=000001" in captured.err
+    assert resumed_summary.examples == 3
+    assert len(evaluated) == 2
+    assert len(_read_jsonl(parts_dir / "part_000000.jsonl")) == 1
+    assert len(_read_jsonl(parts_dir / "part_000001.jsonl")) == 1
+    assert len(_read_jsonl(parts_dir / "part_000002.jsonl")) == 1
+    assert _read_jsonl(parts_dir / "part_000001.jsonl")[0]["row_index"] == 31
+    assert _read_jsonl(parts_dir / "part_000002.jsonl")[0]["row_index"] == 32
+    manifest = json.loads((parts_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["part_count"] == 3
+    assert manifest["completed_examples"] == 3
