@@ -49,6 +49,13 @@ class MutationResult:
     selected_token_end: int
 
 
+@dataclass(frozen=True)
+class MutationSamplingOptions:
+    allow_complex_constants: bool = False
+    allow_distributional_unary_ops: bool = False
+    excluded_random_tokens: tuple[str, ...] = ()
+
+
 def collect_candidate_nodes(expr: Expr, sigma_small: int) -> dict[str, list[NodePosition]]:
     canonical_expr = canonicalize(expr)
     index = index_tree_positions(canonical_expr, sigma_small=sigma_small)
@@ -66,90 +73,42 @@ def sample_valid_subtree(
 ) -> Expr:
     if sigma_small < 0:
         raise ValueError("sigma_small must be non-negative.")
+    options = _mutation_sampling_options(
+        allow_complex_constants=allow_complex_constants,
+        allow_distributional_unary_ops=allow_distributional_unary_ops,
+        excluded_random_tokens=excluded_random_tokens,
+    )
 
     if family == EXPR_FAMILY:
-        return _sample_expr(
-            sigma_small,
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        return _sample_expr(sigma_small, rng, options=options)
     if family == CONST_FAMILY:
-        return _sample_any_const(
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        return _sample_any_const(rng, options=options)
     if family == VAR_FAMILY:
         return Var(name="x")
     if family == UNARY_EXPR_FAMILY:
         if sigma_small < 1:
             raise ValueError("UNARY_EXPR requires sigma_small >= 1.")
         return UnaryOp(
-            op=rng.choice(
-                _allowed_unary_operators(
-                    allow_distributional_unary_ops=allow_distributional_unary_ops,
-                    excluded_random_tokens=excluded_random_tokens,
-                )
-            ),
-            operand=_sample_expr(
-                sigma_small - 1,
-                rng,
-                allow_complex_constants=allow_complex_constants,
-                allow_distributional_unary_ops=allow_distributional_unary_ops,
-                excluded_random_tokens=excluded_random_tokens,
-            ),
+            op=rng.choice(_allowed_unary_operators(options)),
+            operand=_sample_expr(sigma_small - 1, rng, options=options),
         )
     if family == ADD_EXPR_FAMILY:
-        return _sample_binary_expr(
-            "add",
-            sigma_small,
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        return _sample_binary_expr("add", sigma_small, rng, options=options)
     if family == MUL_EXPR_FAMILY:
-        return _sample_binary_expr(
-            "mul",
-            sigma_small,
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        return _sample_binary_expr("mul", sigma_small, rng, options=options)
     if family == POW_EXPR_FAMILY:
         if sigma_small < 1:
             raise ValueError("POW_EXPR requires sigma_small >= 1.")
         remaining = sigma_small - 1
         left_budget, right_budget = _split_budget(remaining, 2, rng)
-        right = _sample_pow_exponent(
-            right_budget,
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        right = _sample_pow_exponent(right_budget, rng, options=options)
         return BinaryOp(
             op="pow",
-            left=_sample_expr(
-                left_budget,
-                rng,
-                allow_complex_constants=allow_complex_constants,
-                allow_distributional_unary_ops=allow_distributional_unary_ops,
-                excluded_random_tokens=excluded_random_tokens,
-            ),
+            left=_sample_expr(left_budget, rng, options=options),
             right=right,
         )
     if family == DIV_EXPR_FAMILY:
-        return _sample_div_expr(
-            sigma_small,
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        return _sample_div_expr(sigma_small, rng, options=options)
 
     raise ValueError(f"Unsupported family: {family}")
 
@@ -166,14 +125,19 @@ def sample_random_expr(
         raise ValueError("max_size must be non-negative.")
 
     rng = rng or random.Random()
+    options = _mutation_sampling_options(
+        allow_complex_constants=allow_complex_constants,
+        allow_distributional_unary_ops=allow_distributional_unary_ops,
+        excluded_random_tokens=excluded_random_tokens,
+    )
     return canonicalize(
         sample_valid_subtree(
             EXPR_FAMILY,
             max_size,
             rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
+            allow_complex_constants=options.allow_complex_constants,
+            allow_distributional_unary_ops=options.allow_distributional_unary_ops,
+            excluded_random_tokens=options.excluded_random_tokens,
         )
     )
 
@@ -188,6 +152,11 @@ def mutate_once(
     allow_distributional_unary_ops: bool = False,
     excluded_random_tokens: Collection[str] | None = None,
 ) -> MutationResult | None:
+    options = _mutation_sampling_options(
+        allow_complex_constants=allow_complex_constants,
+        allow_distributional_unary_ops=allow_distributional_unary_ops,
+        excluded_random_tokens=excluded_random_tokens,
+    )
     canonical_expr = canonicalize(expr)
     index = index_tree_positions(canonical_expr, sigma_small=sigma_small)
     candidates_by_family = _collect_candidate_nodes_from_index(index)
@@ -208,8 +177,8 @@ def mutate_once(
             replacement = sample_const_replacement(
                 original_subtree,
                 rng,
-                allow_complex_constants=allow_complex_constants,
-                excluded_random_tokens=excluded_random_tokens,
+                allow_complex_constants=options.allow_complex_constants,
+                excluded_random_tokens=options.excluded_random_tokens,
             )
             if replacement == original_subtree:
                 continue
@@ -230,9 +199,7 @@ def mutate_once(
                 selected_position,
                 original_subtree,
                 rng,
-                allow_complex_constants=allow_complex_constants,
-                allow_distributional_unary_ops=allow_distributional_unary_ops,
-                excluded_random_tokens=excluded_random_tokens,
+                options=options,
             )
             if result is not None:
                 return result
@@ -242,9 +209,9 @@ def mutate_once(
             EXPR_FAMILY,
             sigma_small,
             rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
+            allow_complex_constants=options.allow_complex_constants,
+            allow_distributional_unary_ops=options.allow_distributional_unary_ops,
+            excluded_random_tokens=options.excluded_random_tokens,
         )
         if not can_sampled_subtree_replace(original_subtree, replacement):
             continue
@@ -273,6 +240,11 @@ def local_replace_once(
     allow_distributional_unary_ops: bool = False,
     excluded_random_tokens: Collection[str] | None = None,
 ) -> MutationResult | None:
+    options = _mutation_sampling_options(
+        allow_complex_constants=allow_complex_constants,
+        allow_distributional_unary_ops=allow_distributional_unary_ops,
+        excluded_random_tokens=excluded_random_tokens,
+    )
     canonical_expr = canonicalize(expr)
     index = index_tree_positions(canonical_expr)
     if selected_node_id < 0 or selected_node_id >= len(index.positions):
@@ -285,9 +257,7 @@ def local_replace_once(
         original_subtree,
         rng,
         max_attempts=max_attempts,
-        allow_complex_constants=allow_complex_constants,
-        allow_distributional_unary_ops=allow_distributional_unary_ops,
-        excluded_random_tokens=excluded_random_tokens,
+        options=options,
     )
 
 
@@ -300,14 +270,15 @@ def sample_const_replacement(
 ) -> Const:
     if not isinstance(node, Const):
         raise TypeError("sample_const_replacement expects a Const node.")
+    options = _mutation_sampling_options(
+        allow_complex_constants=allow_complex_constants,
+        excluded_random_tokens=excluded_random_tokens,
+    )
 
     if node.is_named:
         choices = [
             symbol
-            for symbol in _allowed_named_constants(
-                allow_complex_constants=allow_complex_constants,
-                excluded_random_tokens=excluded_random_tokens,
-            )
+            for symbol in _allowed_named_constants(options)
             if symbol != node.symbol
         ]
         if not choices:
@@ -372,16 +343,10 @@ def _sample_expr(
     sigma_small: int,
     rng: random.Random,
     *,
-    allow_complex_constants: bool,
-    allow_distributional_unary_ops: bool,
-    excluded_random_tokens: Collection[str] | None,
+    options: MutationSamplingOptions,
 ) -> Expr:
     if sigma_small <= 0:
-        return _sample_leaf(
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        return _sample_leaf(rng, options=options)
 
     families = [
         CONST_FAMILY,
@@ -395,48 +360,35 @@ def _sample_expr(
     weights = [4, 1, 2, 1, 1, 1, 1]
     family = rng.choices(families, weights=weights, k=1)[0]
     if family == CONST_FAMILY:
-        return _sample_any_const(
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        return _sample_any_const(rng, options=options)
     if family == VAR_FAMILY:
         return Var(name="x")
     return sample_valid_subtree(
         family,
         sigma_small,
         rng,
-        allow_complex_constants=allow_complex_constants,
-        allow_distributional_unary_ops=allow_distributional_unary_ops,
-        excluded_random_tokens=excluded_random_tokens,
+        allow_complex_constants=options.allow_complex_constants,
+        allow_distributional_unary_ops=options.allow_distributional_unary_ops,
+        excluded_random_tokens=options.excluded_random_tokens,
     )
 
 
 def _sample_leaf(
     rng: random.Random,
     *,
-    allow_complex_constants: bool,
-    excluded_random_tokens: Collection[str] | None,
+    options: MutationSamplingOptions,
 ) -> Expr:
     if rng.random() < 0.75:
-        return _sample_any_const(
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        return _sample_any_const(rng, options=options)
     return Var(name="x")
 
 
 def _sample_any_const(
     rng: random.Random,
     *,
-    allow_complex_constants: bool,
-    excluded_random_tokens: Collection[str] | None,
+    options: MutationSamplingOptions,
 ) -> Const:
-    named_constants = _allowed_named_constants(
-        allow_complex_constants=allow_complex_constants,
-        excluded_random_tokens=excluded_random_tokens,
-    )
+    named_constants = _allowed_named_constants(options)
     if rng.random() < 0.9 or not named_constants:
         return Const(value=rng.choice(NUMERIC_CONSTANT_BANK))
     return Const(symbol=rng.choice(named_constants))
@@ -447,9 +399,7 @@ def _sample_binary_expr(
     sigma_small: int,
     rng: random.Random,
     *,
-    allow_complex_constants: bool,
-    allow_distributional_unary_ops: bool,
-    excluded_random_tokens: Collection[str] | None,
+    options: MutationSamplingOptions,
 ) -> BinaryOp:
     if sigma_small < 1:
         raise ValueError(f"{op} requires sigma_small >= 1.")
@@ -457,20 +407,8 @@ def _sample_binary_expr(
     left_budget, right_budget = _split_budget(remaining, 2, rng)
     return BinaryOp(
         op=op,
-        left=_sample_expr(
-            left_budget,
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
-        ),
-        right=_sample_expr(
-            right_budget,
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
-        ),
+        left=_sample_expr(left_budget, rng, options=options),
+        right=_sample_expr(right_budget, rng, options=options),
     )
 
 
@@ -478,32 +416,18 @@ def _sample_pow_exponent(
     sigma_small: int,
     rng: random.Random,
     *,
-    allow_complex_constants: bool,
-    allow_distributional_unary_ops: bool,
-    excluded_random_tokens: Collection[str] | None,
+    options: MutationSamplingOptions,
 ) -> Expr:
     if sigma_small <= 0 or rng.random() < 0.7:
-        return _sample_any_const(
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            excluded_random_tokens=excluded_random_tokens,
-        )
-    return _sample_expr(
-        sigma_small,
-        rng,
-        allow_complex_constants=allow_complex_constants,
-        allow_distributional_unary_ops=allow_distributional_unary_ops,
-        excluded_random_tokens=excluded_random_tokens,
-    )
+        return _sample_any_const(rng, options=options)
+    return _sample_expr(sigma_small, rng, options=options)
 
 
 def _sample_div_expr(
     sigma_small: int,
     rng: random.Random,
     *,
-    allow_complex_constants: bool,
-    allow_distributional_unary_ops: bool,
-    excluded_random_tokens: Collection[str] | None,
+    options: MutationSamplingOptions,
 ) -> BinaryOp:
     if sigma_small < 1:
         raise ValueError("DIV_EXPR requires sigma_small >= 1.")
@@ -511,21 +435,9 @@ def _sample_div_expr(
     remaining = sigma_small - 1
     for _ in range(16):
         left_budget, right_budget = _split_budget(remaining, 2, rng)
-        left = _sample_expr(
-            left_budget,
-            rng,
-            allow_complex_constants=allow_complex_constants,
-            allow_distributional_unary_ops=allow_distributional_unary_ops,
-            excluded_random_tokens=excluded_random_tokens,
-        )
+        left = _sample_expr(left_budget, rng, options=options)
         right = _coerce_nonzero_denominator(
-            _sample_expr(
-                right_budget,
-                rng,
-                allow_complex_constants=allow_complex_constants,
-                allow_distributional_unary_ops=allow_distributional_unary_ops,
-                excluded_random_tokens=excluded_random_tokens,
-            ),
+            _sample_expr(right_budget, rng, options=options),
             rng,
         )
         if is_obviously_zero(right):
@@ -596,30 +508,39 @@ def _excluded_random_token_set(excluded_random_tokens: Collection[str] | None) -
     return frozenset(str(token) for token in (excluded_random_tokens or ()))
 
 
-def _allowed_named_constants(
+def _mutation_sampling_options(
     *,
     allow_complex_constants: bool,
+    allow_distributional_unary_ops: bool = False,
     excluded_random_tokens: Collection[str] | None,
-) -> tuple[str, ...]:
-    excluded = _excluded_random_token_set(excluded_random_tokens)
-    return tuple(
-        symbol
-        for symbol in NAMED_CONSTANT_BANK
-        if symbol not in excluded and (allow_complex_constants or symbol != _COMPLEX_CONSTANT_TOKEN)
+) -> MutationSamplingOptions:
+    return MutationSamplingOptions(
+        allow_complex_constants=bool(allow_complex_constants),
+        allow_distributional_unary_ops=bool(allow_distributional_unary_ops),
+        excluded_random_tokens=tuple(str(token) for token in (excluded_random_tokens or ())),
     )
 
 
-def _allowed_unary_operators(
-    *,
-    allow_distributional_unary_ops: bool,
-    excluded_random_tokens: Collection[str] | None,
-) -> tuple[str, ...]:
-    excluded = _excluded_random_token_set(excluded_random_tokens)
+def _excluded_tokens(options: MutationSamplingOptions) -> frozenset[str]:
+    return _excluded_random_token_set(options.excluded_random_tokens)
+
+
+def _allowed_named_constants(options: MutationSamplingOptions) -> tuple[str, ...]:
+    excluded = _excluded_tokens(options)
+    return tuple(
+        symbol
+        for symbol in NAMED_CONSTANT_BANK
+        if symbol not in excluded and (options.allow_complex_constants or symbol != _COMPLEX_CONSTANT_TOKEN)
+    )
+
+
+def _allowed_unary_operators(options: MutationSamplingOptions) -> tuple[str, ...]:
+    excluded = _excluded_tokens(options)
     operators = tuple(
         op
         for op in UNARY_OPERATORS
         if op not in excluded
-        and (allow_distributional_unary_ops or op not in _DISTRIBUTIONAL_UNARY_TOKENS)
+        and (options.allow_distributional_unary_ops or op not in _DISTRIBUTIONAL_UNARY_TOKENS)
     )
     if not operators:
         raise ValueError("No unary operators are available after applying random-token exclusions.")
@@ -668,14 +589,11 @@ def _local_replace_selected_node(
     rng: random.Random,
     max_attempts: int = 32,
     *,
-    allow_complex_constants: bool = False,
-    allow_distributional_unary_ops: bool = False,
-    excluded_random_tokens: Collection[str] | None = None,
+    options: MutationSamplingOptions,
 ) -> MutationResult | None:
     candidates = _filter_local_replacement_candidates(
         local_replacement_candidates(original_subtree),
-        allow_distributional_unary_ops=allow_distributional_unary_ops,
-        excluded_random_tokens=excluded_random_tokens,
+        options=options,
     )
     if not candidates:
         return None
@@ -686,8 +604,7 @@ def _local_replace_selected_node(
             original_subtree,
             spec,
             rng,
-            allow_complex_constants=allow_complex_constants,
-            excluded_random_tokens=excluded_random_tokens,
+            options=options,
         )
         if not can_locally_replace(original_subtree, replacement):
             continue
@@ -709,8 +626,7 @@ def _materialize_local_replacement(
     spec: LocalReplacementSpec,
     rng: random.Random,
     *,
-    allow_complex_constants: bool,
-    excluded_random_tokens: Collection[str] | None,
+    options: MutationSamplingOptions,
 ) -> Expr:
     if isinstance(node, (Const, Var)):
         if spec.leaf_kind == NUMERIC_CONST_LEAF:
@@ -718,8 +634,8 @@ def _materialize_local_replacement(
                 return sample_const_replacement(
                     node,
                     rng,
-                    allow_complex_constants=allow_complex_constants,
-                    excluded_random_tokens=excluded_random_tokens,
+                    allow_complex_constants=options.allow_complex_constants,
+                    excluded_random_tokens=options.excluded_random_tokens,
                 )
             return Const(value=rng.choice(NUMERIC_CONSTANT_BANK))
         if spec.leaf_kind == NAMED_CONST_LEAF:
@@ -727,13 +643,10 @@ def _materialize_local_replacement(
                 return sample_const_replacement(
                     node,
                     rng,
-                    allow_complex_constants=allow_complex_constants,
-                    excluded_random_tokens=excluded_random_tokens,
+                    allow_complex_constants=options.allow_complex_constants,
+                    excluded_random_tokens=options.excluded_random_tokens,
                 )
-            choices = _allowed_named_constants(
-                allow_complex_constants=allow_complex_constants,
-                excluded_random_tokens=excluded_random_tokens,
-            )
+            choices = _allowed_named_constants(options)
             if not choices:
                 return node
             return Const(symbol=rng.choice(choices))
@@ -757,17 +670,16 @@ def _materialize_local_replacement(
 def _filter_local_replacement_candidates(
     candidates: tuple[LocalReplacementSpec, ...],
     *,
-    allow_distributional_unary_ops: bool,
-    excluded_random_tokens: Collection[str] | None,
+    options: MutationSamplingOptions,
 ) -> tuple[LocalReplacementSpec, ...]:
-    excluded = _excluded_random_token_set(excluded_random_tokens)
+    excluded = _excluded_tokens(options)
     return tuple(
         spec
         for spec in candidates
         if spec.op is None
         or (
             spec.op not in excluded
-            and (allow_distributional_unary_ops or spec.op not in _DISTRIBUTIONAL_UNARY_TOKENS)
+            and (options.allow_distributional_unary_ops or spec.op not in _DISTRIBUTIONAL_UNARY_TOKENS)
         )
     )
 

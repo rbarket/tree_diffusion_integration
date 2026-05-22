@@ -26,8 +26,8 @@ from src.tree_diffusion.evaluation_common import (
     metadata_item as _metadata_item,
     mutation_trace_record as _mutation_trace_record,
     repair_inputs_from_batch as _repair_inputs,
-    required_metadata as _required_metadata,
     residual_executor_context as _residual_executor_context,
+    summarize_repair_record_groups as _summarize_repair_record_groups,
 )
 from src.tree_diffusion.eval_metrics import (
     RepairGroupSummary,
@@ -38,9 +38,7 @@ from src.tree_diffusion.eval_metrics import (
     numeric_values as _numeric_values,
     optional_bool_metadata as _optional_bool_metadata,
     optional_int_metadata as _optional_int_metadata,
-    repair_group_summary as _repair_group_summary,
     residual_improvement_rate as _residual_improvement_rate,
-    summarize_repair_groups as _summarize_repair_groups,
     used_random_init_group as _used_random_init_group,
 )
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
@@ -313,14 +311,22 @@ def summarize_repair_results(
             if not chosen_ranks
             else sum(1 for rank in chosen_ranks if int(rank) == 1) / len(chosen_ranks)
         ),
-        by_used_random_init=_group_by(
+        by_used_random_init=_summarize_repair_record_groups(
             rows,
             key_fn=lambda row: _used_random_init_group(row.used_random_init),
+            result_fn=lambda row: row.result,
+            final_numeric_residual_fn=lambda result: result.final_numeric_residual,
+            structural_distance_initial_fn=lambda row: row.structural_distance_initial,
+            structural_distance_final_fn=lambda row: row.structural_distance_final,
             numeric_tol=numeric_tol,
         ),
-        by_num_mutations=_group_by(
+        by_num_mutations=_summarize_repair_record_groups(
             rows,
             key_fn=lambda row: _num_mutations_group(row.num_mutations),
+            result_fn=lambda row: row.result,
+            final_numeric_residual_fn=lambda result: result.final_numeric_residual,
+            structural_distance_initial_fn=lambda row: row.structural_distance_initial,
+            structural_distance_final_fn=lambda row: row.structural_distance_final,
             numeric_tol=numeric_tol,
         ),
         stop_reason_counts=dict(Counter(result.stop_reason for result in results)),
@@ -596,38 +602,6 @@ def _repair_example_record(
         "steps_taken": result.steps_taken,
         "steps": [asdict(step) for step in result.steps],
     }
-
-
-def _group_by(
-    records: Sequence[RepairEvaluationRecord],
-    *,
-    key_fn,
-    numeric_tol: float,
-) -> dict[str, RepairGroupSummary]:
-    return _summarize_repair_groups(
-        records,
-        key_fn=key_fn,
-        result_fn=lambda row: row.result,
-        final_numeric_residual_fn=lambda result: result.final_numeric_residual,
-        structural_distance_initial_fn=lambda row: row.structural_distance_initial,
-        structural_distance_final_fn=lambda row: row.structural_distance_final,
-        numeric_tol=numeric_tol,
-    )
-
-
-def _group_summary(
-    records: Sequence[RepairEvaluationRecord],
-    *,
-    numeric_tol: float,
-) -> RepairGroupSummary:
-    return _repair_group_summary(
-        records,
-        result_fn=lambda row: row.result,
-        final_numeric_residual_fn=lambda result: result.final_numeric_residual,
-        structural_distance_initial_fn=lambda row: row.structural_distance_initial,
-        structural_distance_final_fn=lambda row: row.structural_distance_final,
-        numeric_tol=numeric_tol,
-    )
 
 
 def _per_step_metrics(

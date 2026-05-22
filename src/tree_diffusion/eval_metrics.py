@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-import math
 import statistics
 from typing import Any, Callable, Iterable, Sequence, TypeVar
 
 from src.tree_diffusion._common import mean_or_none, rate
+from src.tree_diffusion.numeric import (
+    finite_numeric,
+    is_finite_numeric as is_finite,
+    meets_numeric_tol,
+)
 
 
 @dataclass(frozen=True)
@@ -29,23 +33,6 @@ _ResultT = TypeVar("_ResultT")
 
 def numeric_values(values: Iterable[float | int | None]) -> list[float]:
     return [numeric for value in values if (numeric := finite_numeric(value)) is not None]
-
-
-def finite_numeric(value: Any) -> float | None:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return None
-    return numeric if math.isfinite(numeric) else None
-
-
-def is_finite(value: Any) -> bool:
-    return finite_numeric(value) is not None
-
-
-def meets_numeric_tol(value: float | int | None, numeric_tol: float) -> bool:
-    numeric = finite_numeric(value)
-    return numeric is not None and numeric <= float(numeric_tol)
 
 
 def residual_improvement_rate(

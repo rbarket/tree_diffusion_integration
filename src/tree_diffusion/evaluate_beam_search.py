@@ -25,12 +25,18 @@ from src.tree_diffusion.beam_search import (
     BeamSearchStopConfig,
     beam_search_repair,
 )
+from src.tree_diffusion.cli_common import (
+    optional_float_arg as _optional_float_arg,
+    optional_int_arg as _optional_int_arg,
+)
 from src.tree_diffusion.evaluation_common import (
     batch_size as _batch_size,
+    load_config_values as _load_config_values_common,
     metadata_item as _metadata_item,
     mutation_trace_record as _mutation_trace_record,
     repair_inputs_from_batch as _repair_inputs,
     residual_executor_context as _residual_executor_context,
+    summarize_repair_record_groups as _summarize_repair_record_groups,
 )
 from src.tree_diffusion.eval_metrics import (
     RepairGroupSummary,
@@ -41,11 +47,10 @@ from src.tree_diffusion.eval_metrics import (
     numeric_values as _numeric_values,
     optional_bool_metadata as _optional_bool_metadata,
     optional_int_metadata as _optional_int_metadata,
-    repair_group_summary as _repair_group_summary,
     residual_improvement_rate as _residual_improvement_rate,
-    summarize_repair_groups as _summarize_repair_groups,
     used_random_init_group as _used_random_init_group,
 )
+from src.tree_diffusion.numeric import finite_numeric as _finite_numeric
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
 from src.tree_diffusion.runtime import (
     build_evaluation_dataloader as _build_cli_dataloader,
@@ -290,14 +295,22 @@ def summarize_beam_repair_results(
             for row in rows
         ),
         stop_reason_counts=dict(Counter(result.stop_reason for result in results)),
-        by_used_random_init=_group_by(
+        by_used_random_init=_summarize_repair_record_groups(
             rows,
             key_fn=lambda row: _used_random_init_group(row.used_random_init),
+            result_fn=lambda row: row.result,
+            final_numeric_residual_fn=lambda result: result.best_numeric_residual,
+            structural_distance_initial_fn=lambda row: row.structural_distance_initial,
+            structural_distance_final_fn=lambda row: row.structural_distance_best,
             numeric_tol=stopping.numeric_tol,
         ),
-        by_num_mutations=_group_by(
+        by_num_mutations=_summarize_repair_record_groups(
             rows,
             key_fn=lambda row: _num_mutations_group(row.num_mutations),
+            result_fn=lambda row: row.result,
+            final_numeric_residual_fn=lambda result: result.best_numeric_residual,
+            structural_distance_initial_fn=lambda row: row.structural_distance_initial,
+            structural_distance_final_fn=lambda row: row.structural_distance_best,
             numeric_tol=stopping.numeric_tol,
         ),
     )
@@ -656,112 +669,51 @@ def _beam_example_record(
     }
 
 
-def _group_by(
-    records: Sequence[BeamRepairEvaluationRecord],
-    *,
-    key_fn,
-    numeric_tol: float,
-) -> dict[str, RepairGroupSummary]:
-    return _summarize_repair_groups(
-        records,
-        key_fn=key_fn,
-        result_fn=lambda row: row.result,
-        final_numeric_residual_fn=lambda result: result.best_numeric_residual,
-        structural_distance_initial_fn=lambda row: row.structural_distance_initial,
-        structural_distance_final_fn=lambda row: row.structural_distance_best,
-        numeric_tol=numeric_tol,
-    )
-
-
-def _group_summary(
-    records: Sequence[BeamRepairEvaluationRecord],
-    *,
-    numeric_tol: float,
-) -> RepairGroupSummary:
-    return _repair_group_summary(
-        records,
-        result_fn=lambda row: row.result,
-        final_numeric_residual_fn=lambda result: result.best_numeric_residual,
-        structural_distance_initial_fn=lambda row: row.structural_distance_initial,
-        structural_distance_final_fn=lambda row: row.structural_distance_best,
-        numeric_tol=numeric_tol,
-    )
-
-
-def _optional_int_arg(value: str | int | None) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    lowered = str(value).strip().lower()
-    if lowered in {"none", "null"}:
-        return None
-    return int(lowered)
-
-
-def _optional_float_arg(value: str | float | None) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, float):
-        return value
-    lowered = str(value).strip().lower()
-    if lowered in {"none", "null"}:
-        return None
-    return float(lowered)
+_BEAM_EVAL_CONFIG_FIELDS = {
+    "checkpoint",
+    "precomputed_data_dir",
+    "precomputed_split",
+    "data",
+    "output",
+    "dump_examples",
+    "num_dump_examples",
+    "dump_failures_only",
+    "num_pairs",
+    "batch_size",
+    "num_batches",
+    "device",
+    "seed",
+    "beam_size",
+    "candidate_k",
+    "max_steps",
+    "numeric_tol",
+    "numeric_patience",
+    "structural_patience",
+    "max_expanded_states",
+    "timeout_seconds",
+    "lambda_residual",
+    "lambda_size",
+    "lambda_steps",
+    "lambda_policy",
+    "use_log_residual",
+    "constrain_position",
+    "max_decode_length",
+    "observation_timeout_seconds",
+    "numeric_residual_timeout_seconds",
+    "symbolic_check_timeout_seconds",
+    "residual_workers",
+    "progress_every",
+    "quiet",
+    "compute_structural_metrics",
+}
 
 
 def _load_config_values(config_path: str | None) -> dict[str, Any]:
-    if config_path is None:
-        return {}
-    path = Path(config_path)
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, Mapping):
-        raise TypeError(f"Beam eval config must be a JSON object, got {type(payload).__name__}.")
-    values = dict(payload)
-    known = {
-        "checkpoint",
-        "precomputed_data_dir",
-        "precomputed_split",
-        "data",
-        "output",
-        "dump_examples",
-        "num_dump_examples",
-        "dump_failures_only",
-        "num_pairs",
-        "batch_size",
-        "num_batches",
-        "device",
-        "seed",
-        "beam_size",
-        "candidate_k",
-        "max_steps",
-        "numeric_tol",
-        "numeric_patience",
-        "structural_patience",
-        "max_expanded_states",
-        "timeout_seconds",
-        "lambda_residual",
-        "lambda_size",
-        "lambda_steps",
-        "lambda_policy",
-        "use_log_residual",
-        "constrain_position",
-        "max_decode_length",
-        "observation_timeout_seconds",
-        "numeric_residual_timeout_seconds",
-        "symbolic_check_timeout_seconds",
-        "residual_workers",
-        "progress_every",
-        "quiet",
-        "compute_structural_metrics",
-    }
-    unknown = set(values) - known
-    if unknown:
-        raise ValueError(
-            "Unknown beam eval config field(s): " + ", ".join(sorted(unknown))
-        )
-    return values
+    return _load_config_values_common(
+        config_path,
+        known_fields=_BEAM_EVAL_CONFIG_FIELDS,
+        label="Beam eval",
+    )
 
 
 def _validate_cli_args(args: argparse.Namespace) -> None:
@@ -800,9 +752,7 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
 
 
 def _float_or_none(value: float | int | None) -> float | None:
-    if value is None:
-        return None
-    return float(value)
+    return _finite_numeric(value)
 
 
 __all__ = [

@@ -16,6 +16,11 @@ from src.tree_diffusion.observation import (
     build_observation,
     compute_current_derivative,
 )
+from src.tree_diffusion.numeric import (
+    finite_numeric,
+    is_finite_numeric,
+    meets_numeric_tol,
+)
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
 
@@ -58,18 +63,6 @@ def structural_distance_or_none(current: Expr, target: Expr | None) -> int | Non
         return None
 
 
-def finite_numeric(value: Any) -> float | None:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return None
-    return numeric if math.isfinite(numeric) else None
-
-
-def is_finite_numeric(value: Any) -> bool:
-    return finite_numeric(value) is not None
-
-
 def numeric_key(value: Any) -> float:
     numeric = finite_numeric(value)
     return math.inf if numeric is None else numeric
@@ -90,11 +83,6 @@ def best_numeric_residual(
     if current is None:
         return candidate
     return min(current, candidate)
-
-
-def meets_numeric_tol(value: float | None, numeric_tol: float) -> bool:
-    numeric = finite_numeric(value)
-    return numeric is not None and numeric <= float(numeric_tol)
 
 
 def structural_better(candidate: int | None, current: int | None) -> bool:

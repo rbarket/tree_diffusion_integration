@@ -12,6 +12,11 @@ from src.mathlang.ast import Expr
 from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.tree_diffusion._common import json_safe
+from src.tree_diffusion.eval_metrics import (
+    RepairGroupSummary,
+    repair_group_summary,
+    summarize_repair_groups,
+)
 from src.tree_diffusion.runtime import (
     batch_size,
     metadata_item,
@@ -145,6 +150,46 @@ def load_config_values(path: str | Path | None, *, known_fields: set[str], label
     return values
 
 
+def summarize_repair_record_groups(
+    records: Sequence[Any],
+    *,
+    key_fn: Callable[[Any], str],
+    result_fn: Callable[[Any], Any],
+    final_numeric_residual_fn: Callable[[Any], float | None],
+    structural_distance_initial_fn: Callable[[Any], float | None],
+    structural_distance_final_fn: Callable[[Any], float | None],
+    numeric_tol: float,
+) -> dict[str, RepairGroupSummary]:
+    return summarize_repair_groups(
+        records,
+        key_fn=key_fn,
+        result_fn=result_fn,
+        final_numeric_residual_fn=final_numeric_residual_fn,
+        structural_distance_initial_fn=structural_distance_initial_fn,
+        structural_distance_final_fn=structural_distance_final_fn,
+        numeric_tol=numeric_tol,
+    )
+
+
+def repair_record_group_summary(
+    records: Sequence[Any],
+    *,
+    result_fn: Callable[[Any], Any],
+    final_numeric_residual_fn: Callable[[Any], float | None],
+    structural_distance_initial_fn: Callable[[Any], float | None],
+    structural_distance_final_fn: Callable[[Any], float | None],
+    numeric_tol: float,
+) -> RepairGroupSummary:
+    return repair_group_summary(
+        records,
+        result_fn=result_fn,
+        final_numeric_residual_fn=final_numeric_residual_fn,
+        structural_distance_initial_fn=structural_distance_initial_fn,
+        structural_distance_final_fn=structural_distance_final_fn,
+        numeric_tol=numeric_tol,
+    )
+
+
 def residual_executor_context(
     residual_workers: int,
 ) -> ContextManager[ProcessPoolExecutor | None]:
@@ -166,5 +211,7 @@ __all__ = [
     "mutation_trace_record",
     "repair_inputs_from_batch",
     "required_metadata",
+    "repair_record_group_summary",
     "residual_executor_context",
+    "summarize_repair_record_groups",
 ]

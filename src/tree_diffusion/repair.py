@@ -23,31 +23,11 @@ from src.tree_diffusion.search_common import (
     structural_distance_or_none as _structural_distance_or_none,
     tree_size,
 )
+from src.tree_diffusion.search_types import RepairStep
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
 
 _MISSING_NUMERIC_RESIDUAL_PENALTY = 1e12
-
-
-@dataclass(frozen=True)
-class RepairStep:
-    step_index: int
-    current_prefix: str
-    chosen_prefix: str | None
-    decoded_status: str | None
-    selected_node_id: int | None
-    replacement_tokens: list[str]
-    replacement_subtree_prefix: str | None
-    candidate_rank: int | None
-    policy_logprob: float | None
-    numeric_residual_before: float | None
-    numeric_residual_after: float | None
-    best_numeric_residual_so_far: float | None
-    score: float | None
-    structural_distance_before: int | None = None
-    structural_distance_after: int | None = None
-    exact_symbolic_match: bool = False
-    stop_reason: str | None = None
 
 
 @dataclass(frozen=True)

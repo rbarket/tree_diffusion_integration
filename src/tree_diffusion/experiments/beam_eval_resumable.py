@@ -20,6 +20,10 @@ from src.tree_diffusion.beam_search import (
     BeamSearchStopConfig,
     beam_search_repair,
 )
+from src.tree_diffusion.cli_common import (
+    optional_float_arg as _optional_float_arg,
+    optional_int_arg as _optional_int_arg,
+)
 from src.tree_diffusion.evaluate_beam_search import (
     BeamRepairEvaluationRecord,
     beam_repair_evaluation_summary_to_json,
@@ -625,28 +629,6 @@ def _validate_args(**kwargs: Any) -> None:
         raise ValueError("progress_every must be >= 0.")
     if kwargs["flush_every"] is not None and int(kwargs["flush_every"]) < 1:
         raise ValueError("flush_every must be >= 1 when provided.")
-
-
-def _optional_int_arg(value: str | int | None) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    lowered = str(value).strip().lower()
-    if lowered in {"none", "null"}:
-        return None
-    return int(lowered)
-
-
-def _optional_float_arg(value: str | float | None) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, float):
-        return value
-    lowered = str(value).strip().lower()
-    if lowered in {"none", "null"}:
-        return None
-    return float(lowered)
 
 
 def _optional_float(value: Any) -> float | None:

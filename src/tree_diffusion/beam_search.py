@@ -15,9 +15,6 @@ from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.decoding import apply_decoded_edit, decode_edit_candidates
 from src.tree_diffusion.eval_one_step import numeric_residual_score
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
-from src.tree_diffusion.repair import (
-    RepairStep,
-)
 from src.tree_diffusion.search_common import (
     best_numeric_residual as _best_numeric_residual,
     deadline_expired as _deadline_expired,
@@ -32,6 +29,7 @@ from src.tree_diffusion.search_common import (
     structural_distance_or_none as _structural_distance_or_none,
     tree_size,
 )
+from src.tree_diffusion.search_types import RepairStep
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
 
