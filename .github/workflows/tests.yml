@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  focused-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv when locked
+        if: hashFiles('uv.lock') != ''
+        run: |
+          python -m pip install --upgrade pip uv
+          uv sync
+      - name: Install with pip
+        if: hashFiles('uv.lock') == ''
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Help checks
+        run: |
+          python -m tree_diffusion.precompute_dataset --help >/dev/null
+          python -m tree_diffusion.evaluate_repair --help >/dev/null
+          python -m tree_diffusion.evaluate_beam_search --help >/dev/null
+      - name: Focused tests
+        run: |
+          python -m pytest -q \
+            tests/test_ast_roundtrip.py \
+            tests/test_canonicalization.py \
+            tests/test_mutation.py \
+            tests/test_observation.py \
+            tests/test_tree_diffusion_decoding.py \
+            tests/test_tree_diffusion_repair.py \
+            tests/test_tree_diffusion_beam_search.py \
+            tests/test_tree_diffusion_precompute_dataset.py

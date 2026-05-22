@@ -1,0 +1,20 @@
+{
+  "checkpoint": "runs/tree_diffusion_smoke/checkpoint_best.pt",
+  "precomputed_data_dir": "data/precomputed/smoke",
+  "data": null,
+  "output_dir": "artifacts/eval/one_step_smoke",
+  "num_pairs": 128,
+  "num_batches": 5,
+  "batch_size": 32,
+  "device": "auto",
+  "seed": 123,
+  "max_decode_length": null,
+  "compute_numeric_residual": true,
+  "diagnostic_timeout_seconds": null,
+  "diagnostic_example_timeout_seconds": null,
+  "numeric_residual_timeout_seconds": null,
+  "top_k_values": [4, 8, 16],
+  "num_dump_examples": 50,
+  "dump_failures_only": false,
+  "dump_improvements_only": false
+}

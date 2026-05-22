@@ -1,64 +1,37 @@
 # Tree Diffusion for Symbolic Integration
 
-This repository implements a tree-diffusion edit policy for symbolic integration. The model edits a valid antiderivative AST, differentiates the current candidate, compares that derivative against the target integrand, and repeats repair until the derivative residual is small or the search budget is exhausted.
+## Project Purpose
 
-The implementation adapts the syntax-tree diffusion framework from Kapur, Jenner, and Russell to antiderivative generation. The important domain mapping is:
+This repository implements tree diffusion for symbolic integration. The editable state is a valid antiderivative AST `I_t`, not a flat token string. At each step, the policy observes the target integrand `f`, the current candidate antiderivative `I_t`, the current derivative `g_t = d/dx I_t`, symbolic and numeric residuals such as `r_t = canon(g_t - f)`, and numeric probe features.
 
-| Tree-diffusion paper | Symbolic-integration implementation |
-| --- | --- |
-| program syntax tree `z_t` | current antiderivative AST `I_t` |
-| target output `x_0` | target integrand `f` |
-| current program output `x_t` | current derivative `g_t = dI_t/dx` |
-| image/output difference | symbolic and numeric residual `r_t = canon(g_t - f)` |
-| reverse edit target | first useful AST edit toward the canonical target antiderivative |
+Training labels are reverse edit targets that move a current AST toward the canonical gold antiderivative. Inference supports one-step edit diagnostics, greedy multi-step repair, beam repair over valid AST states, and the hybrid MDLM seed repair path when MDLM prediction JSONL files are available.
 
-## Current implementation scope
+## Repository Map
 
-Implemented components:
+- `src/mathlang/`: AST definitions, parser, serializer, grammar helpers, SymPy conversion, and canonicalization.
+- `src/tree_diffusion/`: mutation, edit paths, observations, tokenizer, model, decoding, precompute, repair/search, and evaluation.
+- `training/` and `src/training/`: training workflow entrypoints and Lightning integration.
+- `tree_diffusion/`: compatibility wrappers for public `python -m tree_diffusion...` commands.
+- `config/precompute/`: dataset generation and validation configs.
+- `config/train/`: model/training configs accepted by `training.workflows.tree_diffusion`.
+- `config/eval/`: one-step, greedy repair, and beam repair eval configs.
+- `config/audit/`: preflight/data audit configs.
+- `tests/`: unit, smoke, and workflow tests.
+- `data/processed/`: place input parquet here.
+- `data/precomputed/`: generated precompute outputs; do not commit.
+- `runs/`: generated checkpoints and training logs; do not commit.
+- `artifacts/`: generated eval summaries/examples; do not commit.
 
-- prefix parser/serializer and typed math ASTs in `src/mathlang/`
-- conservative canonicalization with separate handling for antiderivatives versus integrands/residuals
-- grammar-valid AST mutation and random valid AST sampling
-- reverse-path edit labels from corrupted current trees to canonical target antiderivatives
-- observation construction with derivative, residual, and numeric probe features
-- deterministic tokenizer with math, field, numeric-bucket, and position tokens
-- precomputed training/validation example generation
-- encoder-decoder Transformer edit policy
-- Lightning training workflow
-- one-step edit diagnostics
-- greedy repair evaluation
-- beam-search repair evaluation
-- resumable validation runners and an optional MDLM-seeded hybrid repair experiment
+## Environment Setup
 
-Final benchmark numbers are not committed here. This repository is the implementation and evaluation harness.
+If your checkout includes `uv.lock`, prefer:
 
-## Repository layout
-
-```text
-config/
-  precompute/      JSON configs for fixed precomputed examples
-  train/           JSON configs for Lightning policy training
-  experiments/     small policy-validation experiment configs
-src/
-  mathlang/        AST, grammar, parser, serializer, canonicalization, SymPy conversion
-  tree_diffusion/  mutation, observations, labels, tokenizer, model, precompute, repair, eval
-  training/        Lightning modules, callbacks, config, training workflow
-  data/            legacy prefix preprocessing helpers
-  eval/            legacy symbolic-evaluation helpers
-tree_diffusion/    compatibility wrappers for `python -m tree_diffusion...` entrypoints
-training/          compatibility wrappers for `python -m training...` entrypoints
-docs/              implementation notes and focused workflow docs
-tests/             unit, smoke, and workflow tests
-data/              ignored generated/input data; only `.gitkeep` files are committed
-runs/              ignored training outputs/checkpoints; only `.gitkeep` files are committed
-artifacts/         ignored evaluation artifacts; only `.gitkeep` files are committed
+```bash
+uv sync
+source .venv/bin/activate
 ```
 
-Most implementation imports currently use the `src.*` package path. The root-level `tree_diffusion/` and `training/` packages are compatibility wrappers for command-line entrypoints.
-
-## Setup
-
-Python 3.10+ is expected.
+Pip fallback:
 
 ```bash
 python -m venv .venv
@@ -67,280 +40,271 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-The project dependencies are declared in `pyproject.toml`. GPU training additionally requires a PyTorch build compatible with the machine CUDA stack.
+Then run:
 
-## Data expectations
+```bash
+python -m pytest -q
+```
 
-Most workflows expect a processed parquet file at:
+Full training and eval require the training stack in `pyproject.toml`, including PyTorch, Lightning, pandas, pyarrow, SymPy, and optionally wandb.
+
+## Data Layout
+
+Put the processed dataset at:
 
 ```text
 data/processed/train_prefix_filtered.parquet
 ```
 
-The default column names are:
+Required columns:
 
 ```text
 integrand_prefix
 integral_prefix
 ```
 
-Each row is one supervised integration pair `(f, I*)` in space-separated prefix tokens. Example prefix fragments look like:
+`integrand_prefix` is the target integrand `f` in space-separated prefix notation. `integral_prefix` is the gold antiderivative `I*` in the same notation. The parquet file is not committed to Git; retrieve it from the team artifact store or handoff location.
 
-```text
-div pow x INT+ 3 INT+ 3
-sin x
-ln x
+Schema check:
+
+```bash
+python - <<'PY'
+import pandas as pd
+path = "data/processed/train_prefix_filtered.parquet"
+df = pd.read_parquet(path)
+print(df.shape)
+print(df[["integrand_prefix", "integral_prefix"]].head())
+PY
 ```
 
-Generated data, checkpoints, parquet shards, JSONL files, and run artifacts are ignored by git. Copy the processed parquet into `data/processed/` before running precompute, training, or validation. If starting from raw infix data, `src/data/preprocess_prefix_dataset.py` contains a legacy helper, but it expects the legacy vocabulary file used by the earlier token-level integration repo.
+## Canonical Fresh-Clone Workflow
 
-## Core workflows
-
-### 1. Precompute tree-diffusion examples
-
-Precomputation generates fixed supervised edit examples and validation shards. This is preferred for repeatable training and validation because observation construction uses SymPy and can be slow online.
-
-Small smoke precompute:
+### 1. Precompute Smoke Examples
 
 ```bash
 python -m tree_diffusion.precompute_dataset \
-  --config config/precompute/tree_diffusion_precompute_light.json \
+  --config config/precompute/smoke.json \
+  --input-data data/processed/train_prefix_filtered.parquet \
+  --output-dir data/precomputed/smoke \
   --overwrite
 ```
 
-Larger training precompute:
-
-```bash
-python -m tree_diffusion.precompute_dataset \
-  --config config/precompute/tree_diffusion_precompute_train.json \
-  --resume
-```
-
-Useful overrides:
-
-```bash
-python -m tree_diffusion.precompute_dataset \
-  --config config/precompute/tree_diffusion_precompute_train.json \
-  --input-data data/processed/train_prefix_filtered.parquet \
-  --output-dir data/precomputed/tree_diffusion_v1 \
-  --train-limit 1000000 \
-  --val-limit 10000 \
-  --num-workers 32 \
-  --resume
-```
-
-Important outputs:
+Expected outputs:
 
 ```text
-data/precomputed/tree_diffusion_v1/
+data/precomputed/smoke/
   metadata.json
   tokenizer_metadata.json
   audit_summary.json
-  train/shard_*.parquet
-  train/audit_summary.json
-  val/shard_*.parquet
-  val/audit_summary.json
+  train/
+    shard_*.parquet
+    audit_summary.json
+  val/
+    shard_*.parquet
+    audit_summary.json
 ```
 
-Use `--overwrite` for a clean rebuild. Use `--resume` to continue a compatible interrupted run. Do not combine `--overwrite` and `--resume`.
+Inspect the precompute audit:
 
-### 2. Train the policy
+```bash
+cat data/precomputed/smoke/audit_summary.json
+```
 
-Online training directly samples examples from the processed parquet:
+### 2. Train from Precomputed Examples
 
 ```bash
 python -m training.workflows.tree_diffusion \
-  --config config/train/tree_diffusion.json
+  --config config/train/precomputed_smoke.json
 ```
 
-Precomputed training uses fixed shards:
-
-```bash
-python -m training.workflows.tree_diffusion \
-  --config config/train/tree_diffusion.json \
-  --use-precomputed \
-  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
-  --output-dir runs/tree_diffusion_precomputed
-```
-
-Small/tiny training run for debugging:
-
-```bash
-python -m training.workflows.tree_diffusion \
-  --config config/train/tree_diffusion.json \
-  --train-data data/processed/train_prefix_filtered.parquet \
-  --output-dir runs/tree_diffusion_smoke \
-  --num-epochs 1 \
-  --batch-size 8 \
-  --num-workers 0 \
-  --enable-wandb false
-```
-
-Resume from a saved checkpoint:
-
-```bash
-python -m training.workflows.tree_diffusion \
-  --config config/train/tree_diffusion.json \
-  --use-precomputed \
-  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
-  --resume-from runs/tree_diffusion_precomputed/checkpoint_step_latest.pt \
-  --output-dir runs/tree_diffusion_precomputed
-```
-
-Common outputs:
+Expected checkpoint outputs:
 
 ```text
-runs/<run_name>/
-  metrics.jsonl
-  checkpoint_step_latest.pt
+runs/tree_diffusion_smoke/
   checkpoint_best.pt
-  lightning/last.ckpt
-  lightning/best.ckpt
+  checkpoint_step_latest.pt
+  lightning/
+    best.ckpt
+    last.ckpt
 ```
 
-Both legacy `.pt` checkpoints and Lightning `.ckpt` checkpoints are supported by the inference loaders.
+Use this checkpoint for eval:
 
-### 3. One-step edit evaluation
+```text
+runs/tree_diffusion_smoke/checkpoint_best.pt
+```
 
-One-step evaluation checks whether the model can decode one valid, applicable edit from held-out currents. It is a diagnostic for edit-position prediction, replacement parsing, structural improvement, and optional numeric residual improvement.
+### 3. One-Step Validation Eval
 
 ```bash
-python -m src.tree_diffusion.eval_one_step \
-  --checkpoint runs/tree_diffusion_precomputed/checkpoint_best.pt \
-  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
-  --precomputed-split val \
+python -m tree_diffusion.experiments.one_step_inference_eval \
+  --config config/eval/one_step_smoke.json
+```
+
+Equivalent explicit form:
+
+```bash
+python -m tree_diffusion.experiments.one_step_inference_eval \
+  --checkpoint runs/tree_diffusion_smoke/checkpoint_best.pt \
+  --precomputed-data-dir data/precomputed/smoke \
+  --output-dir artifacts/eval/one_step_smoke \
   --num-batches 5 \
   --batch-size 32 \
-  --candidate-k 8 \
-  --use-first-applicable-candidate \
-  --output artifacts/test_summaries/one_step_eval.json \
   --device auto
 ```
 
-To inspect raw position-token behavior, disable the first-token position mask:
-
-```bash
-python -m src.tree_diffusion.eval_one_step \
-  --checkpoint runs/tree_diffusion_precomputed/checkpoint_best.pt \
-  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
-  --no-constrain-position
-```
-
-### 4. Greedy repair on validation data
-
-Greedy repair repeatedly proposes top-k edits, applies valid candidates, and chooses the next state using residual-based scoring.
+### 4. Greedy Repair Validation Eval
 
 ```bash
 python -m tree_diffusion.evaluate_repair \
-  --checkpoint runs/tree_diffusion_precomputed/checkpoint_best.pt \
-  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
+  --config config/eval/greedy_smoke.json
+```
+
+Equivalent explicit form:
+
+```bash
+python -m tree_diffusion.evaluate_repair \
+  --checkpoint runs/tree_diffusion_smoke/checkpoint_best.pt \
+  --precomputed-data-dir data/precomputed/smoke \
   --precomputed-split val \
-  --num-pairs 512 \
+  --output artifacts/eval/greedy_repair_smoke.json \
+  --dump-examples artifacts/eval/greedy_repair_smoke_examples.jsonl \
+  --num-batches 5 \
   --batch-size 32 \
-  --num-batches 16 \
   --candidate-k 8 \
   --max-steps 10 \
-  --patience 2 \
-  --output artifacts/test_summaries/greedy_repair_summary.json \
-  --dump-examples artifacts/test_summaries/greedy_repair_examples.jsonl \
-  --num-dump-examples 50 \
   --device auto
 ```
 
-Key summary fields include success rate, exact symbolic match rate, numeric success rate, residual-improvement rate, stop reasons, and stratified metrics by corruption source and mutation count.
-
-### 5. Beam-search repair on validation data
-
-Beam search keeps multiple valid AST states and scores candidates using numeric residual, tree size, step count, and policy log probability.
+### 5. Beam Repair Validation Eval
 
 ```bash
 python -m tree_diffusion.evaluate_beam_search \
-  --checkpoint runs/tree_diffusion_precomputed/checkpoint_best.pt \
-  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
-  --precomputed-split val \
-  --num-pairs 512 \
-  --batch-size 16 \
-  --num-batches 32 \
-  --beam-size 8 \
-  --candidate-k 8 \
-  --max-steps 10 \
-  --numeric-patience 5 \
-  --residual-workers 16 \
-  --output artifacts/test_summaries/beam_repair_summary.json \
-  --dump-examples artifacts/test_summaries/beam_repair_examples.jsonl \
-  --num-dump-examples 50 \
-  --device auto
+  --config config/eval/beam_smoke.json
 ```
 
-For longer validation runs, prefer the resumable runners under `src/tree_diffusion/experiments/repair_eval_resumable.py` and `src/tree_diffusion/experiments/beam_eval_resumable.py`.
-
-### 6. Optional MDLM-seeded hybrid repair
-
-The hybrid experiment parses MDLM candidate antiderivatives into the tree grammar and runs beam repair from every parseable seed.
+Equivalent explicit form:
 
 ```bash
-python -m tree_diffusion.experiments.hybrid_mdlm_repair \
-  --predictions artifacts/hybrid/mdlm_tree/mdlm_predictions.jsonl \
-  --tree-checkpoint runs/tree_diffusion_precomputed/checkpoint_best.pt \
-  --output artifacts/hybrid/mdlm_tree/hybrid_repair_summary.json \
-  --examples-out artifacts/hybrid/mdlm_tree/hybrid_repair_examples.jsonl \
+python -m tree_diffusion.evaluate_beam_search \
+  --checkpoint runs/tree_diffusion_smoke/checkpoint_best.pt \
+  --precomputed-data-dir data/precomputed/smoke \
+  --precomputed-split val \
+  --output artifacts/eval/beam_repair_smoke.json \
+  --dump-examples artifacts/eval/beam_repair_smoke_examples.jsonl \
+  --num-batches 5 \
+  --batch-size 32 \
   --beam-size 8 \
   --candidate-k 8 \
   --max-steps 10 \
   --numeric-patience 5 \
-  --seed-selection all_parseable \
-  --residual-workers 16 \
   --device auto
 ```
 
-See `docs/hybrid_mdlm_tree_repair.md` for the expected prediction JSONL format and hybrid metrics.
+### 6. Fresh-Clone Smoke Script
 
-## Tests and quality checks
+For a fast end-to-end precompute and help-check smoke run:
 
-Run tests through Python so the repository root is on `sys.path`:
+```bash
+scripts/smoke_handoff.sh
+```
+
+The script creates a tiny parquet at `data/processed/handoff_smoke.parquet` if needed, runs precompute into `data/precomputed/handoff_smoke`, checks expected files, and prints the next training/eval commands.
+
+## Config Guide
+
+- `config/precompute/`: data generation, label validation, observation settings, and shard settings.
+- `config/train/`: supervised policy training settings. `precomputed_smoke.json` and `precomputed_full.json` are the preferred handoff templates for fixed precomputed examples.
+- `config/eval/`: one-step, greedy repair, and beam repair defaults.
+- `config/audit/`: lightweight preflight/data audit configs.
+
+Common fields:
+
+- `input_data`: processed parquet for precompute.
+- `output_dir`: generated output directory for precompute, training, or directory-based eval.
+- `examples_per_pair_train`, `examples_per_pair_val`: number of sampled current states per pair.
+- `sigma_small`, `smax`, `rho`: mutation/noise schedule settings.
+- `residual_mode`: observation residual mode, usually `both`.
+- `validate_labels`: precompute label validation flag.
+- `batch_size`, `num_epochs`: training/eval batch and schedule controls.
+- `use_precomputed`, `precomputed_data_dir`: train/eval from fixed precomputed shards.
+- `checkpoint`: model checkpoint for eval.
+- `num_batches`: eval batch budget.
+- `candidate_k`: number of edit candidates decoded per state.
+- `beam_size`: number of states retained by beam repair.
+- `max_steps`: repair depth budget.
+- `device`: `auto`, `cpu`, or a torch device string such as `cuda`.
+
+CLI arguments override JSON config values. Keep method-defining fields in configs for reproducibility, and record any CLI overrides with final artifacts.
+
+## Output File Map
+
+- `metadata.json`: tokenizer/config/precompute metadata and example counts.
+- `tokenizer_metadata.json`: tokenizer settings needed to load precomputed data.
+- `audit_summary.json`: precompute validity, label, observation, and warning summary.
+- `shard_*.parquet`: encoded precomputed examples.
+- `checkpoint_best.pt`: default checkpoint to use for eval.
+- `checkpoint_step_latest.pt`: latest non-Lightning checkpoint.
+- `lightning/*.ckpt`: Lightning resume/checkpoint files.
+- Eval summary JSON files: aggregate one-step, greedy, beam, or hybrid metrics.
+- Eval examples JSONL files: per-example predictions, repair paths, failures, and diagnostics.
+
+## Tests
+
+Full suite:
 
 ```bash
 python -m pytest -q
 ```
 
-Useful focused checks:
+Focused fast subset:
 
 ```bash
-python -m pytest -q tests/test_ast_roundtrip.py tests/test_canonicalization.py tests/test_mutation.py
-python -m pytest -q tests/test_tree_diffusion_training_examples.py tests/test_tree_diffusion_decoding.py
-python -m pytest -q tests/test_tree_diffusion_repair.py tests/test_tree_diffusion_beam_search.py
+python -m pytest -q \
+  tests/test_ast_roundtrip.py \
+  tests/test_canonicalization.py \
+  tests/test_mutation.py \
+  tests/test_observation.py \
+  tests/test_tree_diffusion_decoding.py \
+  tests/test_tree_diffusion_repair.py \
+  tests/test_tree_diffusion_beam_search.py \
+  tests/test_tree_diffusion_precompute_dataset.py \
+  tests/test_tree_diffusion_evaluate_repair.py \
+  tests/test_tree_diffusion_evaluate_beam_search.py \
+  tests/test_tree_diffusion_beam_eval_resumable.py \
+  tests/test_tree_diffusion_repair_eval_resumable.py
 ```
 
-Training and workflow tests require the dependencies in `pyproject.toml`, including Lightning. Some smoke tests create temporary parquet data and checkpoints; committed datasets and checkpoints are not required for those tests.
+## Known Limitations
 
-## Implementation details to preserve
+- Replacement-subtree generation is validated after decoding; it may not be fully grammar-constrained during generation.
+- SymPy observation construction can fail or timeout for some expressions; partial observations use missing-field tokens and warnings.
+- Structural distance metrics use the gold antiderivative and are validation-only, not real inference signals.
+- Beam search currently uses numeric residual scoring rather than a learned value network.
+- Position tokens are preorder ids for the current tree and are not stable across edits.
+- Generated data/checkpoints are large and must live outside Git.
 
-- All training and inference states should remain valid ASTs.
-- Antiderivative canonicalization may strip top-level additive constants; integrands, derivatives, and residuals must not.
-- Position tokens are preorder node ids for the current canonical tree only. They are re-indexed after every edit.
-- Reverse edit paths are supervised labels only. They must not be included in inference-time observations.
-- Replacement decoding is currently validated after generation; only the first edit-position token is constrained by default.
-- Beam search intentionally uses derivative residual scoring instead of a learned value network.
-- Random noising defaults are `sigma_small=2`, `smax=5`, and `rho=0.2` unless a config overrides them.
+## Artifact Handoff Checklist
 
-## Documentation index
+Outgoing owner should provide:
 
-- `docs/code_structure.md`: module map
-- `docs/refactor_notes.md`: recent refactor compatibility notes
-- `docs/tree_diffusion_decoding_and_one_step_eval.md`: edit decoding and one-step metrics
-- `docs/hybrid_mdlm_tree_repair.md`: MDLM-seeded repair workflow
-- `notebooks/mutation_walkthrough.ipynb`: mutation examples and sanity checks
+- `data/processed/train_prefix_filtered.parquet`
+- final `data/precomputed/<name>/`
+- final `runs/<name>/checkpoint_best.pt`
+- final `runs/<name>/checkpoint_step_latest.pt`
+- final eval JSON summaries
+- final eval JSONL examples
+- exact git commit hash
+- exact precompute/train/eval configs
+- random seeds
+- hardware/runtime notes
+- expected headline metrics
+- known failure modes
+- artifact storage location
+- checksums:
 
-## Handoff checklist
-
-Before transferring ownership, make sure the team has:
-
-- the processed parquet dataset or clear instructions for regenerating it
-- the exact precompute config used for any published run
-- `metadata.json`, `audit_summary.json`, and tokenizer metadata for every precomputed dataset
-- the training config, checkpoint, and metrics JSONL for every model to be reused
-- one-step, greedy, and beam validation summaries for the chosen checkpoint
-- a short note identifying whether validation used online or precomputed currents
-- the dependency installation command used on the training machine
-- the random seeds and hardware details for important runs
-- known failure modes, especially SymPy timeouts, unsupported prefix tokens, and invalid replacement decoding
+```bash
+sha256sum data/processed/train_prefix_filtered.parquet
+find data/precomputed/<name> -type f -print0 | sort -z | xargs -0 sha256sum > precomputed.sha256
+sha256sum runs/<name>/checkpoint_best.pt runs/<name>/checkpoint_step_latest.pt
+```

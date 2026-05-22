@@ -3,6 +3,10 @@
 !/README.md
 !/pyproject.toml
 !/uv.lock
+!/.github/
+!/.github/**
+!/scripts/
+!/scripts/**
 !/config/
 !/config/**
 !/src/
@@ -14,8 +18,10 @@
 !/tests/
 !/tests/**
 !/docs/
+!/docs/*.md
 !/docs/code_structure.md
 !/docs/refactor_notes.md
+!/docs/handoff.md
 !/docs/hybrid_mdlm_tree_repair.md
 !/docs/tree_diffusion_decoding_and_one_step_eval.md
 !/notebooks/
@@ -41,6 +47,7 @@ htmlcov/
 /data/**
 !/data/**/
 !/data/**/.gitkeep
+data/processed/*.parquet
 !/artifacts/
 /artifacts/**
 !/artifacts/**/

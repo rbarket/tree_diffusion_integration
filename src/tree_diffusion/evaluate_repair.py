@@ -23,6 +23,7 @@ from src.tree_diffusion._common import (
 from src.tree_diffusion.edit_path import structural_distance
 from src.tree_diffusion.evaluation_common import (
     batch_size as _batch_size,
+    load_config_values as _load_config_values_common,
     metadata_item as _metadata_item,
     mutation_trace_record as _mutation_trace_record,
     repair_inputs_from_batch as _repair_inputs,
@@ -390,37 +391,75 @@ def repair_evaluation_summary_to_json(summary: RepairEvaluationSummary) -> dict[
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Evaluate greedy tree-diffusion repair.")
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--precomputed-data-dir", default=None)
-    parser.add_argument("--precomputed-split", choices=("train", "val"), default="val")
-    parser.add_argument("--data", default=None)
-    parser.add_argument("--output", default=None)
-    parser.add_argument("--num-pairs", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-batches", type=int, default=5)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--max-steps", type=int, default=10)
-    parser.add_argument("--candidate-k", type=int, default=8)
-    parser.add_argument("--numeric-tol", type=float, default=1e-10)
-    parser.add_argument("--patience", type=int, default=2)
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=None)
+    config_args, _ = config_parser.parse_known_args(argv)
+    config_values = _load_config_values(config_args.config)
+
+    parser = argparse.ArgumentParser(
+        description="Evaluate greedy tree-diffusion repair.",
+        parents=[config_parser],
+    )
+    parser.add_argument("--checkpoint", default=config_values.get("checkpoint"))
+    parser.add_argument("--precomputed-data-dir", default=config_values.get("precomputed_data_dir"))
+    parser.add_argument(
+        "--precomputed-split",
+        choices=("train", "val"),
+        default=config_values.get("precomputed_split", "val"),
+    )
+    parser.add_argument("--data", default=config_values.get("data"))
+    parser.add_argument("--output", default=config_values.get("output"))
+    parser.add_argument("--num-pairs", type=int, default=config_values.get("num_pairs", 128))
+    parser.add_argument("--batch-size", type=int, default=config_values.get("batch_size", 32))
+    parser.add_argument("--num-batches", type=int, default=config_values.get("num_batches", 5))
+    parser.add_argument("--device", default=config_values.get("device", "auto"))
+    parser.add_argument("--seed", type=int, default=config_values.get("seed", 123))
+    parser.add_argument("--max-steps", type=int, default=config_values.get("max_steps", 10))
+    parser.add_argument("--candidate-k", type=int, default=config_values.get("candidate_k", 8))
+    parser.add_argument("--numeric-tol", type=float, default=config_values.get("numeric_tol", 1e-10))
+    parser.add_argument("--patience", type=int, default=config_values.get("patience", 2))
     parser.add_argument(
         "--selection-strategy",
         choices=("rank1", "residual_scored"),
-        default="residual_scored",
+        default=config_values.get("selection_strategy", "residual_scored"),
     )
-    parser.add_argument("--constrain-position", dest="constrain_position", action="store_true", default=True)
+    parser.add_argument(
+        "--constrain-position",
+        dest="constrain_position",
+        action="store_true",
+        default=bool(config_values.get("constrain_position", True)),
+    )
     parser.add_argument("--no-constrain-position", dest="constrain_position", action="store_false")
-    parser.add_argument("--max-decode-length", type=int, default=None)
-    parser.add_argument("--observation-timeout-seconds", type=float, default=2.0)
-    parser.add_argument("--numeric-residual-timeout-seconds", type=float, default=2.0)
-    parser.add_argument("--symbolic-check-timeout-seconds", type=float, default=2.0)
-    parser.add_argument("--residual-workers", type=int, default=0)
-    parser.add_argument("--no-structural-metrics", dest="compute_structural_metrics", action="store_false")
-    parser.add_argument("--dump-examples", default=None)
-    parser.add_argument("--num-dump-examples", type=int, default=50)
-    parser.add_argument("--dump-failures-only", action="store_true")
+    parser.add_argument("--max-decode-length", type=int, default=config_values.get("max_decode_length"))
+    parser.add_argument(
+        "--observation-timeout-seconds",
+        type=float,
+        default=config_values.get("observation_timeout_seconds", 2.0),
+    )
+    parser.add_argument(
+        "--numeric-residual-timeout-seconds",
+        type=float,
+        default=config_values.get("numeric_residual_timeout_seconds", 2.0),
+    )
+    parser.add_argument(
+        "--symbolic-check-timeout-seconds",
+        type=float,
+        default=config_values.get("symbolic_check_timeout_seconds", 2.0),
+    )
+    parser.add_argument("--residual-workers", type=int, default=config_values.get("residual_workers", 0))
+    parser.add_argument(
+        "--no-structural-metrics",
+        dest="compute_structural_metrics",
+        action="store_false",
+        default=bool(config_values.get("compute_structural_metrics", True)),
+    )
+    parser.add_argument("--dump-examples", default=config_values.get("dump_examples"))
+    parser.add_argument("--num-dump-examples", type=int, default=config_values.get("num_dump_examples", 50))
+    parser.add_argument(
+        "--dump-failures-only",
+        action="store_true",
+        default=bool(config_values.get("dump_failures_only", False)),
+    )
     args = parser.parse_args(argv)
 
     _validate_cli_args(args)
@@ -667,6 +706,8 @@ def _exact_match_step(result: RepairResult) -> int | None:
 
 
 def _validate_cli_args(args: argparse.Namespace) -> None:
+    if args.checkpoint is None:
+        raise ValueError("Provide --checkpoint or set checkpoint in --config.")
     if (args.data is None) == (args.precomputed_data_dir is None):
         raise ValueError("Provide exactly one data source: --data or --precomputed-data-dir.")
     if args.num_pairs < 1:
@@ -693,6 +734,43 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
         raise ValueError("--residual-workers must be >= 0.")
     if args.num_dump_examples < 0:
         raise ValueError("--num-dump-examples must be >= 0.")
+
+
+_REPAIR_EVAL_CONFIG_FIELDS = {
+    "checkpoint",
+    "precomputed_data_dir",
+    "precomputed_split",
+    "data",
+    "output",
+    "num_pairs",
+    "batch_size",
+    "num_batches",
+    "device",
+    "seed",
+    "max_steps",
+    "candidate_k",
+    "numeric_tol",
+    "patience",
+    "selection_strategy",
+    "constrain_position",
+    "max_decode_length",
+    "observation_timeout_seconds",
+    "numeric_residual_timeout_seconds",
+    "symbolic_check_timeout_seconds",
+    "residual_workers",
+    "compute_structural_metrics",
+    "dump_examples",
+    "num_dump_examples",
+    "dump_failures_only",
+}
+
+
+def _load_config_values(config_path: str | None) -> dict[str, Any]:
+    return _load_config_values_common(
+        config_path,
+        known_fields=_REPAIR_EVAL_CONFIG_FIELDS,
+        label="Greedy repair eval",
+    )
 
 
 __all__ = [

@@ -35,6 +35,7 @@ from src.tree_diffusion.eval_one_step import (
 )
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
 from src.tree_diffusion.evaluation_common import (
+    load_config_values as _load_config_values_common,
     mutation_trace_record as _mutation_trace_record,
 )
 from src.tree_diffusion.runtime import (
@@ -201,34 +202,69 @@ def run_one_step_inference_eval(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=None)
+    config_args, _ = config_parser.parse_known_args(argv)
+    config_values = _load_config_values(config_args.config)
+
     parser = argparse.ArgumentParser(
-        description="Run one-step inference-mode evaluation for a tree-diffusion policy."
+        description="Run one-step inference-mode evaluation for a tree-diffusion policy.",
+        parents=[config_parser],
     )
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--precomputed-data-dir", default=None)
-    parser.add_argument("--data", default=None)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--num-pairs", type=int, default=128)
-    parser.add_argument("--num-batches", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--max-decode-length", type=int, default=None)
-    parser.add_argument("--diagnostic-timeout-seconds", type=float, default=None)
-    parser.add_argument("--diagnostic-example-timeout-seconds", type=float, default=None)
-    parser.add_argument("--numeric-residual-timeout-seconds", type=float, default=None)
-    parser.add_argument("--top-k-values", type=int, nargs="+", default=list(DEFAULT_TOP_K_VALUES))
-    parser.add_argument("--num-dump-examples", type=int, default=50)
-    parser.add_argument("--dump-failures-only", action="store_true")
-    parser.add_argument("--dump-improvements-only", action="store_true")
+    parser.add_argument("--checkpoint", default=config_values.get("checkpoint"))
+    parser.add_argument("--precomputed-data-dir", default=config_values.get("precomputed_data_dir"))
+    parser.add_argument("--data", default=config_values.get("data"))
+    parser.add_argument("--output-dir", default=config_values.get("output_dir"))
+    parser.add_argument("--num-pairs", type=int, default=config_values.get("num_pairs", 128))
+    parser.add_argument("--num-batches", type=int, default=config_values.get("num_batches", 5))
+    parser.add_argument("--batch-size", type=int, default=config_values.get("batch_size", 32))
+    parser.add_argument("--device", default=config_values.get("device", "auto"))
+    parser.add_argument("--seed", type=int, default=config_values.get("seed", 123))
+    parser.add_argument("--max-decode-length", type=int, default=config_values.get("max_decode_length"))
+    parser.add_argument(
+        "--diagnostic-timeout-seconds",
+        type=float,
+        default=config_values.get("diagnostic_timeout_seconds"),
+    )
+    parser.add_argument(
+        "--diagnostic-example-timeout-seconds",
+        type=float,
+        default=config_values.get("diagnostic_example_timeout_seconds"),
+    )
+    parser.add_argument(
+        "--numeric-residual-timeout-seconds",
+        type=float,
+        default=config_values.get("numeric_residual_timeout_seconds"),
+    )
+    parser.add_argument(
+        "--top-k-values",
+        type=int,
+        nargs="+",
+        default=list(config_values.get("top_k_values", DEFAULT_TOP_K_VALUES)),
+    )
+    parser.add_argument("--num-dump-examples", type=int, default=config_values.get("num_dump_examples", 50))
+    parser.add_argument(
+        "--dump-failures-only",
+        action="store_true",
+        default=bool(config_values.get("dump_failures_only", False)),
+    )
+    parser.add_argument(
+        "--dump-improvements-only",
+        action="store_true",
+        default=bool(config_values.get("dump_improvements_only", False)),
+    )
     parser.add_argument(
         "--compute-numeric-residual",
         dest="compute_numeric_residual",
         action="store_true",
-        default=True,
+        default=bool(config_values.get("compute_numeric_residual", True)),
     )
     parser.add_argument("--no-compute-numeric-residual", dest="compute_numeric_residual", action="store_false")
     args = parser.parse_args(argv)
+    if args.checkpoint is None:
+        raise ValueError("Provide --checkpoint or set checkpoint in --config.")
+    if args.output_dir is None:
+        raise ValueError("Provide --output-dir or set output_dir in --config.")
 
     summary = run_one_step_inference_eval(
         checkpoint=str(args.checkpoint),
@@ -664,6 +700,36 @@ def _validate_args(
 def _validate_optional_timeout(name: str, value: float | None) -> None:
     if value is not None and value <= 0.0:
         raise ValueError(f"{name} must be > 0 when provided.")
+
+
+_ONE_STEP_INFERENCE_CONFIG_FIELDS = {
+    "checkpoint",
+    "precomputed_data_dir",
+    "data",
+    "output_dir",
+    "num_pairs",
+    "num_batches",
+    "batch_size",
+    "device",
+    "seed",
+    "max_decode_length",
+    "compute_numeric_residual",
+    "diagnostic_timeout_seconds",
+    "diagnostic_example_timeout_seconds",
+    "numeric_residual_timeout_seconds",
+    "top_k_values",
+    "num_dump_examples",
+    "dump_failures_only",
+    "dump_improvements_only",
+}
+
+
+def _load_config_values(config_path: str | None) -> dict[str, Any]:
+    return _load_config_values_common(
+        config_path,
+        known_fields=_ONE_STEP_INFERENCE_CONFIG_FIELDS,
+        label="One-step inference eval",
+    )
 
 
 def _section_prefix(

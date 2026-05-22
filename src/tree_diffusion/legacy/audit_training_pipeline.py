@@ -20,7 +20,7 @@ from src.tree_diffusion.train_step import (
 from src.utils.seeding import set_global_seed
 
 
-DEFAULT_CONFIG_PATH = "config/train/tree_diffusion_preflight.json"
+DEFAULT_CONFIG_PATH = "config/audit/preflight.json"
 
 
 def main(argv: Sequence[str] | None = None) -> int:

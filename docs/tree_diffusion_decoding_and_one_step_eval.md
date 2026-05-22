@@ -24,16 +24,16 @@ Only the first generated token is constrained. During greedy decoding, the first
 
 This matters because a position token is meaningful only relative to the current AST. With `--constrain-position`, `valid_position_rate` is expected to be high by construction. Use `--no-constrain-position` to inspect raw model behavior.
 
-## Not Yet Constrained
+## Search Status And Remaining Constraint
 
 Replacement subtree generation is still unconstrained. The decoder emits tokens greedily, then `decode_edit_tokens(...)` parses the replacement afterward.
 
-Current limitations:
+Current status:
 
-- No tree-state beam search.
-- No multi-step repair.
-- No full grammar-constrained replacement decoding.
-- No precompute, objective, architecture, or checkpoint format changes.
+- Greedy multi-step repair exists and retries top-k candidates at each current AST state.
+- Beam search exists and keeps multiple valid antiderivative AST states.
+- Replacement-subtree decoding is validated after generation and may not be fully grammar-constrained during decoding.
+- The precompute schema, objective, architecture, checkpoint format, and JSON summary keys are unchanged by these decoding diagnostics.
 
 ## Invalid Replacement Handling
 
@@ -85,8 +85,8 @@ Evaluate a checkpoint on precomputed examples:
 
 ```bash
 python -m src.tree_diffusion.eval_one_step \
-  --checkpoint runs/tree_diffusion/checkpoint_best.pt \
-  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
+  --checkpoint runs/<tree_diffusion_run>/checkpoint_best.pt \
+  --precomputed-data-dir data/precomputed/<name> \
   --num-batches 5 \
   --batch-size 32 \
   --device auto
@@ -96,8 +96,8 @@ Evaluate raw position behavior:
 
 ```bash
 python -m src.tree_diffusion.eval_one_step \
-  --checkpoint runs/tree_diffusion/checkpoint_best.pt \
-  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
+  --checkpoint runs/<tree_diffusion_run>/checkpoint_best.pt \
+  --precomputed-data-dir data/precomputed/<name> \
   --no-constrain-position
 ```
 
@@ -105,8 +105,8 @@ Evaluate top-k edit proposals and score the first applicable candidate:
 
 ```bash
 python -m src.tree_diffusion.eval_one_step \
-  --checkpoint runs/tree_diffusion/checkpoint_best.pt \
-  --precomputed-data-dir data/precomputed/tree_diffusion_v1 \
+  --checkpoint runs/<tree_diffusion_run>/checkpoint_best.pt \
+  --precomputed-data-dir data/precomputed/<name> \
   --candidate-k 8 \
   --use-first-applicable-candidate
 ```

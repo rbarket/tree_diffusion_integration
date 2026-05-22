@@ -289,7 +289,7 @@ class TreeDiffusionOneStepEvaluationTests(unittest.TestCase):
         model = _correct_edit_model(tokenizer)
 
         with patch(
-            "src.tree_diffusion.eval_one_step.compute_current_derivative",
+            "src.tree_diffusion.search_common.compute_current_derivative",
             side_effect=ObservationTimeoutError("forced"),
         ):
             summary = evaluate_one_step_edits(

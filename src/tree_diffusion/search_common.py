@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any
+from typing import Any, Sequence
 
 import sympy as sp
 import torch
@@ -12,9 +12,11 @@ from src.mathlang.canonicalize import canonicalize
 from src.mathlang.conversions import ast_to_sympy
 from src.tree_diffusion.edit_path import structural_distance
 from src.tree_diffusion.observation import (
+    ObservationTimeoutError,
     _observation_timeout,
     build_observation,
     compute_current_derivative,
+    compute_numeric_probes,
 )
 from src.tree_diffusion.numeric import (
     finite_numeric,
@@ -52,6 +54,52 @@ def derivative_matches_target(
             )
     except Exception:
         return False
+
+
+def numeric_residual_score(
+    antiderivative: Expr,
+    target_integrand: Expr,
+    *,
+    probe_points: Sequence[float] | None = None,
+    timeout_seconds: float | None = None,
+) -> float | None:
+    score, _ = numeric_residual_score_with_status(
+        antiderivative,
+        target_integrand,
+        probe_points=probe_points,
+        timeout_seconds=timeout_seconds,
+    )
+    return score
+
+
+def numeric_residual_score_with_status(
+    antiderivative: Expr,
+    target_integrand: Expr,
+    *,
+    probe_points: Sequence[float] | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[float | None, bool]:
+    try:
+        with _observation_timeout(timeout_seconds):
+            current_derivative = compute_current_derivative(antiderivative)
+            probes = compute_numeric_probes(
+                current_derivative,
+                target_integrand,
+                probe_points=probe_points,
+            )
+    except ObservationTimeoutError:
+        return None, True
+    except Exception:
+        return None, False
+
+    finite_squared_abs = [
+        float(value)
+        for is_finite, value in zip(probes.finite_mask, probes.residual_abs_squared)
+        if is_finite and value is not None and math.isfinite(float(value))
+    ]
+    if not finite_squared_abs:
+        return None, False
+    return sum(finite_squared_abs) / len(finite_squared_abs), False
 
 
 def structural_distance_or_none(current: Expr, target: Expr | None) -> int | None:
@@ -143,6 +191,8 @@ __all__ = [
     "is_finite_numeric",
     "meets_numeric_tol",
     "numeric_better",
+    "numeric_residual_score",
+    "numeric_residual_score_with_status",
     "numeric_key",
     "remaining_timeout",
     "structural_better",

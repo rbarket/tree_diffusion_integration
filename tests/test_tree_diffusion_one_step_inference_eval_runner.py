@@ -148,6 +148,46 @@ class OneStepInferenceEvalRunnerTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertTrue((output_dir / "one_step_eval_summary.json").exists())
 
+    def test_cli_main_accepts_config_and_cli_overrides(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            parquet = write_toy_parquet(work_dir / "toy.parquet")
+            checkpoint = _write_tiny_checkpoint(work_dir / "checkpoint.pt", parquet)
+            config_output_dir = work_dir / "config_eval"
+            override_output_dir = work_dir / "override_eval"
+            config_path = work_dir / "one_step_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "checkpoint": str(checkpoint),
+                        "data": str(parquet),
+                        "output_dir": str(config_output_dir),
+                        "num_pairs": 2,
+                        "num_batches": 1,
+                        "batch_size": 1,
+                        "device": "cpu",
+                        "max_decode_length": 4,
+                        "top_k_values": [2],
+                        "num_dump_examples": 0,
+                        "compute_numeric_residual": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = one_step_inference_main(
+                [
+                    "--config",
+                    str(config_path),
+                    "--output-dir",
+                    str(override_output_dir),
+                ]
+            )
+
+            self.assertEqual(result, 0)
+            self.assertFalse((config_output_dir / "one_step_eval_summary.json").exists())
+            self.assertTrue((override_output_dir / "one_step_eval_summary.json").exists())
+
 
 def _write_tiny_checkpoint(path: Path, parquet: Path) -> Path:
     torch.manual_seed(123)

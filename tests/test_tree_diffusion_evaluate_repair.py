@@ -175,6 +175,48 @@ class TreeDiffusionRepairEvaluationTests(unittest.TestCase):
                 self.assertIn("candidate_rank", row["steps"][0])
                 self.assertIn("best_numeric_residual_so_far", row["steps"][0])
 
+    def test_cli_config_values_can_be_overridden(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            parquet = write_toy_parquet(work_dir / "toy.parquet")
+            checkpoint = _write_tiny_checkpoint(work_dir / "checkpoint.pt", parquet)
+            config_path = work_dir / "greedy_config.json"
+            output = work_dir / "from_config.json"
+            override_output = work_dir / "override.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "checkpoint": str(checkpoint),
+                        "data": str(parquet),
+                        "output": str(output),
+                        "num_pairs": 2,
+                        "num_batches": 1,
+                        "batch_size": 1,
+                        "device": "cpu",
+                        "max_steps": 1,
+                        "candidate_k": 1,
+                        "patience": 1,
+                        "selection_strategy": "rank1",
+                        "residual_workers": 0,
+                        "compute_structural_metrics": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = evaluate_repair_main(
+                [
+                    "--config",
+                    str(config_path),
+                    "--output",
+                    str(override_output),
+                ]
+            )
+
+            self.assertEqual(result, 0)
+            self.assertFalse(output.exists())
+            self.assertTrue(override_output.exists())
+
 
 def _known_repair_batch() -> dict:
     return {

@@ -13,7 +13,6 @@ from src.mathlang.canonicalize import canonicalize
 from src.mathlang.parser import parse_prefix_string
 from src.mathlang.serializer import serialize_prefix_string
 from src.tree_diffusion.decoding import apply_decoded_edit, decode_edit_candidates
-from src.tree_diffusion.eval_one_step import numeric_residual_score
 from src.tree_diffusion.model import TreeDiffusionPolicyModel
 from src.tree_diffusion.search_common import (
     best_numeric_residual as _best_numeric_residual,
@@ -24,6 +23,7 @@ from src.tree_diffusion.search_common import (
     meets_numeric_tol as _meets_numeric_tol,
     numeric_better as _numeric_better,
     numeric_key as _numeric_key,
+    numeric_residual_score,
     remaining_timeout as _remaining_timeout,
     structural_better as _structural_better,
     structural_distance_or_none as _structural_distance_or_none,

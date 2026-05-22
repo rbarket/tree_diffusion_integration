@@ -4,7 +4,6 @@ import argparse
 from collections import Counter
 from dataclasses import asdict, dataclass
 import json
-import math
 from pathlib import Path
 import time
 from typing import Any, Iterable, Mapping, Sequence
@@ -32,8 +31,6 @@ from src.tree_diffusion.model import TreeDiffusionPolicyModel
 from src.tree_diffusion.observation import (
     ObservationTimeoutError,
     _observation_timeout,
-    compute_current_derivative,
-    compute_numeric_probes,
 )
 from src.tree_diffusion.runtime import (
     batch_size as _runtime_batch_size,
@@ -46,6 +43,10 @@ from src.tree_diffusion.runtime import (
     tensor_row,
     tokenizer_from_checkpoint,
     tokenizer_from_precomputed,
+)
+from src.tree_diffusion.search_common import (
+    numeric_residual_score,
+    numeric_residual_score_with_status as _numeric_residual_score_with_status,
 )
 from src.tree_diffusion.tokenizer import TreeDiffusionTokenizer
 
@@ -377,52 +378,6 @@ def evaluate_one_step_edits(
         any_structural_improvements=any_structural_improvements if candidate_mode else None,
         first_applicable_ranks=first_applicable_ranks if candidate_mode else None,
     )
-
-
-def numeric_residual_score(
-    antiderivative: Expr,
-    target_integrand: Expr,
-    *,
-    probe_points: Sequence[float] | None = None,
-    timeout_seconds: float | None = None,
-) -> float | None:
-    score, _ = _numeric_residual_score_with_status(
-        antiderivative,
-        target_integrand,
-        probe_points=probe_points,
-        timeout_seconds=timeout_seconds,
-    )
-    return score
-
-
-def _numeric_residual_score_with_status(
-    antiderivative: Expr,
-    target_integrand: Expr,
-    *,
-    probe_points: Sequence[float] | None = None,
-    timeout_seconds: float | None = None,
-) -> tuple[float | None, bool]:
-    try:
-        with _observation_timeout(timeout_seconds):
-            current_derivative = compute_current_derivative(antiderivative)
-            probes = compute_numeric_probes(
-                current_derivative,
-                target_integrand,
-                probe_points=probe_points,
-            )
-    except ObservationTimeoutError:
-        return None, True
-    except Exception:
-        return None, False
-
-    finite_squared_abs = [
-        float(value)
-        for is_finite, value in zip(probes.finite_mask, probes.residual_abs_squared)
-        if is_finite and value is not None and math.isfinite(float(value))
-    ]
-    if not finite_squared_abs:
-        return None, False
-    return sum(finite_squared_abs) / len(finite_squared_abs), False
 
 
 def _one_step_edit_summary(
